@@ -170,16 +170,33 @@ def save_info_file(filepath, info):
         print_log(f"Error saving file: {e}", Colors.RED)
         return False
 
-def metadata_needed(filepath, refetch_old):
+def metadata_needed(filepath, refetch_old, refetch_only_not_found=False):
     """檢查是否需要掃描"""
     base, _ = os.path.splitext(filepath)
     info_path = f"{base}{INFO_SUFFIX}"
     
-    if not os.path.exists(info_path):
-        return True
-    
     if refetch_old:
         return True
+
+    if not os.path.exists(info_path):
+        return True
+
+    if refetch_only_not_found:
+        try:
+            with open(info_path, 'r', encoding='utf-8') as f:
+                info = json.load(f)
+                
+            # Check for skeleton_file flag
+            if info.get("skeleton_file", False):
+                return True
+                
+            # Also check extension flag (newer format)
+            exts = info.get("extensions", {})
+            if exts.get(SHORT_NAME, {}).get("skeleton_file", False):
+                return True
+        except:
+             # If file is corrupted, re-fetch
+             return True
         
     # 如果文件存在且不強制更新，則跳過
     # 這裡可以加入版本檢查邏輯，但為了簡化CLI，預設存在即跳過
@@ -310,7 +327,7 @@ def get_link_type(filepath, root_directory):
 
     return ""
 
-def scan_directory(directory, refetch_old=False):
+def scan_directory(directory, refetch_old=False, refetch_only_not_found=False):
     """文件掃描主函數 (支援子目錄總結)"""
     print_log(f"Starting scan in: {directory}", Colors.BLUE)
     
@@ -408,7 +425,7 @@ def scan_directory(directory, refetch_old=False):
         # 如果是 not refetch_old, and info exists -> need_update is False.
         # 但如果 info 讀不到 hash (corrupted?), we calculated new hash.
         # Still, logic should be consistent.
-        need_update = metadata_needed(filepath, refetch_old)
+        need_update = metadata_needed(filepath, refetch_old, refetch_only_not_found)
 
         if not need_update:
             if not is_duplicate:
@@ -513,6 +530,8 @@ def main():
     parser.add_argument("path", help="要掃描的目錄路徑")
     parser.add_argument("--refetch", action="store_true", help="強制重新獲取已此存在的元數據")
     
+    parser.add_argument("--refetch-only-not-found", action="store_true", help="只對之前未找到 (Not Found/Skeleton) 的模型重新獲取元數據")
+
     args = parser.parse_args()
     
     target_path = os.path.abspath(args.path)
@@ -521,7 +540,7 @@ def main():
         sys.exit(1)
         
     try:
-        scan_directory(target_path, refetch_old=args.refetch)
+        scan_directory(target_path, refetch_old=args.refetch, refetch_only_not_found=args.refetch_only_not_found)
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.")
         sys.exit(0)

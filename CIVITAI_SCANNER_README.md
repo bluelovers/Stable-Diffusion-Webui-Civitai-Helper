@@ -32,6 +32,7 @@ python civitai_scanner.py <目標目錄路徑> [options]
 
 *   `<path>`: **(必填)** 要掃描的模型根目錄。
 *   `--refetch`: **(選填)** 強制重新從 Civitai API 獲取元數據，即使本地已有 `.info` 文件。
+*   `--refetch-only-not-found`: **(選填)** 只針對之前未找到 (Not Found / Skeleton) 的模型重新獲取元數據。這在 Civitai 更新其資料庫後非常有用。
 
 ### 範例
 
@@ -41,6 +42,9 @@ python civitai_scanner.py "D:\StableDiffusion\models"
 
 # 強制更新所有元數據
 python civitai_scanner.py "D:\StableDiffusion\models" --refetch
+
+# 僅重試之前失敗 (Not Found) 的項目
+python civitai_scanner.py "D:\StableDiffusion\models" --refetch-only-not-found
 ```
 
 ---
