@@ -487,7 +487,7 @@ def scan_directory(directory, refetch_old=False):
         }
         
         # 對該子目錄進行遞歸掃描 (啟用 followlinks 以進入 junction)
-        for root, _, files in os.walk(subdir_path, followlinks=True):
+        for root, _, files in os.walk(subdir_path):
             for file in files:
                 filepath = os.path.join(root, file)
                 process_file(filepath, subdir_stats)
