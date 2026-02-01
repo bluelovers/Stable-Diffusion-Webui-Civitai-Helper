@@ -195,6 +195,17 @@ def print_summary(title, stats):
     updated_color = Colors.GREEN if stats['updated'] > 0 else ""
     print(f"Updated:       {updated_color}{stats['updated']}{Colors.RESET}")
     
+    # Duplicates (Blue if > 0)
+    dup_count = len(stats['duplicates'])
+    dup_color = Colors.BLUE if dup_count > 0 else ""
+    print(f"Duplicates:    {dup_color}{dup_count}{Colors.RESET}")
+    
+    # Links
+    if stats.get('symlinks', 0) > 0:
+        print(f"Symlinks:      {Colors.CYAN}{stats['symlinks']}{Colors.RESET}")
+    if stats.get('hardlinks', 0) > 0:
+        print(f"Hardlinks:     {Colors.CYAN}{stats['hardlinks']}{Colors.RESET}")
+    
     # Not Found (Yellow if > 0)
     nf_color = Colors.YELLOW if stats['not_found'] > 0 else ""
     print(f"Not Found:     {nf_color}{stats['not_found']}{Colors.RESET}")
@@ -202,6 +213,31 @@ def print_summary(title, stats):
     # Failed (Red if > 0)
     if stats['failed'] > 0:
         print(f"Failed:        {Colors.RED}{stats['failed']}{Colors.RESET}")
+
+    # 顯示重複檔案路徑 (分組顯示)
+    if dup_count > 0:
+        print(f"\n{Colors.GRAY}[Duplicate Files List]{Colors.RESET}")
+        
+        # Group by hash
+        groups = {}
+        for item in stats['duplicates']:
+            # 兼容舊版僅有字串的情況 (防禦性編程) 或 新版 tuple (path, hash)
+            if isinstance(item, tuple):
+                p, h = item
+                short_h = h[:8]
+                if short_h not in groups:
+                    groups[short_h] = []
+                groups[short_h].append(p)
+            else:
+                # Fallback for plain string
+                if "Unknown" not in groups:
+                    groups["Unknown"] = []
+                groups["Unknown"].append(item)
+        
+        for h, paths in groups.items():
+            print(f"  Hash: {Colors.BLUE}{h}...{Colors.RESET}")
+            for p in paths:
+                print(f"    - {p}")
         
     print(border + "\n")
 
@@ -210,11 +246,19 @@ def scan_directory(directory, refetch_old=False):
     print_log(f"Starting scan in: {directory}", Colors.BLUE)
     
     global_stats = {
-        "processed": 0, "ignored": 0, "updated": 0, "not_found": 0, "failed": 0
+        "processed": 0, "ignored": 0, "updated": 0, 
+        "not_found": 0, "failed": 0, "duplicates": [],
+        "symlinks": 0, "hardlinks": 0
     }
     
     # 使用 mutable list 來讓內嵌函式修改計數
-    counter = [0] 
+    counter = [0]
+    
+    # 哈希緩存: { hash: { 'data': api_info, 'path': first_filepath } }
+    hash_cache = {}
+    
+    # 記錄已經將 "正本" 加入過 duplicates 清單的 Hash
+    recorded_dup_originals = set()
 
     def process_file(filepath, stats_obj):
         """處理單個文件的邏輯"""
@@ -225,41 +269,139 @@ def scan_directory(directory, refetch_old=False):
         counter[0] += 1
         stats_obj["processed"] += 1
         
-        # 關鍵修改：確保這裡顯示的相對路徑是基於最上層的 directory
         relative_path = os.path.relpath(filepath, start=directory)
         progress_prefix = f"{Colors.GRAY}[{counter[0]}]{Colors.RESET}"
-
-        if not metadata_needed(filepath, refetch_old):
-            stats_obj["ignored"] += 1
-            return
-            
-        print_log(f"{progress_prefix} Processing: {Colors.CYAN}{relative_path}", Colors.RESET)
         
-        # 1. Hash
-        model_hash = calculate_sha256(filepath)
+        # 檢測連結類型 (用於日誌和緩存)
+        # 注意: 這裡的 link_type_str 包含顏色代碼，直接用於顯示
+        link_type_str = ""
+        is_symlink = os.path.islink(filepath)
+        
+        if is_symlink:
+            stats_obj["symlinks"] = stats_obj.get("symlinks", 0) + 1
+            link_type_str = f" {Colors.CYAN}(Symlink){Colors.RESET}"
+        else:
+            try:
+                st = os.stat(filepath)
+                if st.st_nlink > 1:
+                    stats_obj["hardlinks"] = stats_obj.get("hardlinks", 0) + 1
+                    link_type_str = f" {Colors.CYAN}(Hardlink){Colors.RESET}"
+            except Exception:
+                pass
+
+        # 0. 嘗試從現有元數據讀取 Hash (優化效能)
+        model_hash = None
+        base, _ = os.path.splitext(filepath)
+        info_path = f"{base}{INFO_SUFFIX}"
+        
+        if not refetch_old and os.path.exists(info_path):
+            try:
+                with open(info_path, 'r', encoding='utf-8') as f:
+                    local_info = json.load(f)
+                    files_list = local_info.get("files", [])
+                    if files_list:
+                        for file_node in files_list:
+                            hashes = file_node.get("hashes", {})
+                            if "SHA256" in hashes:
+                                model_hash = hashes["SHA256"]
+                                break
+            except Exception:
+                pass
+
+        # 1. 如果沒讀到或者需要重算，則計算 Hash
+        if not model_hash:
+            model_hash = calculate_sha256(filepath)
+            
         if not model_hash:
             print_log(f"{progress_prefix} Failed hash: {relative_path}", Colors.RED)
             stats_obj["failed"] += 1
             return
             
-        # 2. API
-        time.sleep(DELAY)
-        info = get_model_info_from_civitai(model_hash)
+        is_duplicate = False
+        info = None
+        
+        # 2. Check Cache
+        if model_hash in hash_cache:
+            is_duplicate = True
+            cached_entry = hash_cache[model_hash]
+            original_path_abs = cached_entry['path']
+            original_path = os.path.relpath(original_path_abs, start=directory)
+            original_link_type = cached_entry.get('link_type', '') # 獲取正本的連結類型
+            
+            print_log(f"{progress_prefix} Duplicate detected{link_type_str} (Same as {original_path})", Colors.GRAY)
+            
+            # Record duplicate with label
+            if model_hash not in recorded_dup_originals:
+                # 將正本加入清單 (包含其類型標示)
+                label = f"{original_path}{original_link_type}"
+                stats_obj["duplicates"].append((label, model_hash))
+                recorded_dup_originals.add(model_hash)
+            
+            # 將當前副本加入清單 (包含其類型標示)
+            current_label = f"{relative_path}{link_type_str}"
+            stats_obj["duplicates"].append((current_label, model_hash))
+            
+            info = cached_entry['data']
+            if isinstance(info, dict):
+                info = info.copy()
+
+        else:
+            # First time seeing this hash
+            hash_cache[model_hash] = {
+                'data': None,
+                'path': filepath,
+                'link_type': link_type_str # 存儲類型標示供後續副本使用
+            }
+
+        # Check if metadata update is needed
+        # 注意: 即使我們剛從 info 讀了 hash，這裡如果是 True (例如 user delete .json but keep .info?)
+        # 其實 metadata_needed checks checks .info existence.
+        # 如果是 not refetch_old, and info exists -> need_update is False.
+        # 但如果 info 讀不到 hash (corrupted?), we calculated new hash.
+        # Still, logic should be consistent.
+        need_update = metadata_needed(filepath, refetch_old)
+
+        if not need_update:
+            if not is_duplicate:
+                stats_obj["ignored"] += 1
+            # If it IS a duplicate, we already counted it in duplicates list.
+            return
+
+        # --- If execution reaches here, we DO need to write/update metadata ---
+
+        # If duplicate but missing info (lazy load)
+        if is_duplicate and info is None:
+            time.sleep(DELAY) 
+            info = get_model_info_from_civitai(model_hash)
+            hash_cache[model_hash]['data'] = info
+        
+        # New file needing update
+        elif not is_duplicate:
+            time.sleep(DELAY)
+            info = get_model_info_from_civitai(model_hash)
+            hash_cache[model_hash]['data'] = info
+            
+        print_log(f"{progress_prefix} Processing: {Colors.CYAN}{relative_path}", Colors.RESET)
         
         is_skeleton = False
         if not info:
-            print_log(f"Model not found: {relative_path}", Colors.YELLOW)
+            if not is_duplicate:
+                 print_log(f"Model not found: {relative_path}", Colors.YELLOW)
+            
             info = create_skeleton_info(filepath, model_hash)
             is_skeleton = True
         else:
             model_name = info.get('model', {}).get('name', 'Unknown')
-            print_log(f"Found info: {Colors.GREEN}{model_name}", Colors.RESET)
+            if not is_duplicate: 
+                print_log(f"Found info: {Colors.GREEN}{model_name}", Colors.RESET)
         
-        # 3. Process & Save
         info = process_model_info(info, is_skeleton)
         
         if save_info_file(filepath, info):
-            if is_skeleton:
+            if is_duplicate:
+                # Already added to list above
+                pass
+            elif is_skeleton:
                 stats_obj["not_found"] += 1
             else:
                 stats_obj["updated"] += 1
@@ -291,7 +433,9 @@ def scan_directory(directory, refetch_old=False):
         print_log(f"Scanning subdirectory: {subdir}...", Colors.BLUE)
         
         subdir_stats = {
-            "processed": 0, "ignored": 0, "updated": 0, "not_found": 0, "failed": 0
+            "processed": 0, "ignored": 0, "updated": 0, 
+            "not_found": 0, "failed": 0, "duplicates": [],
+            "symlinks": 0, "hardlinks": 0
         }
         
         # 對該子目錄進行遞歸掃描
@@ -300,12 +444,17 @@ def scan_directory(directory, refetch_old=False):
                 filepath = os.path.join(root, file)
                 process_file(filepath, subdir_stats)
         
-        # 將子目錄統計合併到全域
+        # 將子目錄統計合併到全域 (duplicates extend list)
         for k in global_stats:
-            global_stats[k] += subdir_stats[k]
+            if k == "duplicates":
+                global_stats[k].extend(subdir_stats[k])
+            else:
+                global_stats[k] += subdir_stats[k]
             
-        # 若有更新檔案，顯示該子目錄的總結
-        if subdir_stats["updated"] > 0 or subdir_stats["not_found"] > 0:
+        # 若有更新檔案(updated, not_found, duplicates)
+        if (subdir_stats["updated"] > 0 or 
+            subdir_stats["not_found"] > 0 or 
+            len(subdir_stats["duplicates"]) > 0):
             print_summary(subdir, subdir_stats)
 
     # 最終全域總結
