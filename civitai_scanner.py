@@ -283,7 +283,7 @@ def scan_directory(directory, refetch_old=False):
     subdirs = [d for d in root_items 
                if os.path.isdir(os.path.join(directory, d))]
     
-    subdirs.sort()
+    subdirs.sort(key=str.lower)
 
     for subdir in subdirs:
         subdir_path = os.path.join(directory, subdir)
