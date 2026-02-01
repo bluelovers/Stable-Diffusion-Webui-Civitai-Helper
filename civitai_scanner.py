@@ -12,6 +12,7 @@ Civitai Model Scanner CLI
 """
 
 import os
+import stat
 import sys
 import json
 import time
@@ -235,6 +236,32 @@ def print_summary(title, stats, scan_root=None):
         
     print(border + "\n")
 
+def is_junction_or_link(path):
+    """
+    在 Windows 上用 os.lstat() 搭配 stat.FILE_ATTRIBUTE_REPARSE_POINT 
+    可以先判斷「這個路徑是不是某種 reparse point」。
+    接著再用 os.path.islink() 判斷是否為 symlink。
+    如果是 reparse point 但不是 symlink，那麼它很可能就是 junction。
+    """
+    link_type = ""
+    try:
+        if os.path.islink(path):
+            link_type = "Symlink"
+        else:
+            is_dir = os.path.isdir(path)
+
+            st = os.lstat(path)
+            if is_dir and st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                link_type = "Junction"
+            elif not is_dir and st.st_nlink > 1:
+                link_type = "Hardlink"
+    except:
+        if link_type:
+            return link_type
+        return None
+
+    return link_type
+
 def get_link_type(filepath, root_directory):
     """(Lazy) Detect link type for a specific file"""
     try:
@@ -243,17 +270,10 @@ def get_link_type(filepath, root_directory):
     except:
         return ""
 
-    if os.path.islink(filepath):
-        return f" {Colors.CYAN}(Symlink){Colors.RESET}"
-    
-    # Hardlink check
-    try:
-        st = os.stat(filepath)
-        # Only count hardlinks for files, not directories
-        if not os.path.isdir(filepath) and st.st_nlink > 1:
-            return f" {Colors.CYAN}(Hardlink){Colors.RESET}"
-    except:
-        pass
+    # Check file itself
+    link_type = is_junction_or_link(filepath)
+    if link_type == "Symlink" or link_type == "Hardlink":
+        return f" {Colors.CYAN}({link_type}){Colors.RESET}"
 
     # Junction/Link check in parents
     check_dir = os.path.dirname(filepath)
@@ -261,8 +281,10 @@ def get_link_type(filepath, root_directory):
     
     while True:
         # Check if current dir is a link/junction
-        if os.path.islink(check_dir):
-            return f" {Colors.CYAN}(Junction){Colors.RESET}"
+        # Use helper check
+        ptype = is_junction_or_link(check_dir)
+        if ptype:
+             return f" {Colors.CYAN}({ptype}){Colors.RESET}"
             
         # Stop if we strictly reached the scan root
         if os.path.normcase(check_dir) == root_norm:
