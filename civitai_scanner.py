@@ -29,9 +29,47 @@ SHORT_NAME = "sd_civitai_helper"
 VERSION = "1.8.13"  # 保持與主專案一致或自定義
 DELAY = 0.5  # API 請求間隔 (秒)
 
-def print_log(msg):
+# Windows VT Mode support
+def enable_colors():
+    """Detect if we can use colors (ANSI) and enable them on Windows if needed."""
+    if not sys.stdout.isatty():
+        return False
+        
+    if os.name == 'nt':
+        try:
+            from ctypes import windll, byref, c_ulong, create_string_buffer
+            hOut = windll.kernel32.GetStdHandle(-11)
+            mode = c_ulong()
+            if not windll.kernel32.GetConsoleMode(hOut, byref(mode)):
+                return False
+            # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+            mode.value |= 0x0004
+            windll.kernel32.SetConsoleMode(hOut, mode)
+            return True
+        except:
+            return False
+    return True
+
+USE_COLORS = enable_colors()
+
+class Colors:
+    RESET = "\033[0m" if USE_COLORS else ""
+    BOLD = "\033[1m" if USE_COLORS else ""
+    RED = "\033[91m" if USE_COLORS else ""
+    GREEN = "\033[92m" if USE_COLORS else ""
+    YELLOW = "\033[93m" if USE_COLORS else ""
+    BLUE = "\033[94m" if USE_COLORS else ""
+    CYAN = "\033[96m" if USE_COLORS else ""
+    GRAY = "\033[90m" if USE_COLORS else ""
+
+def print_log(msg, color=None):
     timestamp = datetime.now().strftime("%H:%M:%S")
-    print(f"[{timestamp}] {msg}")
+    timestamp_str = f"{Colors.GRAY}[{timestamp}]{Colors.RESET}"
+    
+    if color:
+        print(f"{timestamp_str} {color}{msg}{Colors.RESET}")
+    else:
+        print(f"{timestamp_str} {msg}")
 
 def calculate_sha256(filepath):
     """計算文件的 SHA256 哈希值"""
@@ -45,7 +83,7 @@ def calculate_sha256(filepath):
                 sha256_hash.update(block)
         return sha256_hash.hexdigest().upper()
     except Exception as e:
-        print_log(f"Error calculating hash: {e}")
+        print_log(f"Error calculating hash: {e}", Colors.RED)
         return None
 
 def get_model_info_from_civitai(model_hash):
@@ -60,10 +98,10 @@ def get_model_info_from_civitai(model_hash):
         elif response.status_code == 404:
             return None
         else:
-            print_log(f"API Error: Status {response.status_code}")
+            print_log(f"API Error: Status {response.status_code}", Colors.RED)
             return None
     except Exception as e:
-        print_log(f"Connection Error: {e}")
+        print_log(f"Connection Error: {e}", Colors.RED)
         return None
 
 def create_skeleton_info(filepath, model_hash):
@@ -124,10 +162,10 @@ def save_info_file(filepath, info):
     try:
         with open(info_path, 'w', encoding='utf-8') as f:
             json.dump(info, f, indent=4, ensure_ascii=False)
-        print_log(f"Saved metadata: {os.path.basename(info_path)}")
+        # print_log(f"Saved metadata: {os.path.basename(info_path)}") # 減少日誌噪音
         return True
     except Exception as e:
-        print_log(f"Error saving file: {e}")
+        print_log(f"Error saving file: {e}", Colors.RED)
         return False
 
 def metadata_needed(filepath, refetch_old):
@@ -147,19 +185,29 @@ def metadata_needed(filepath, refetch_old):
 
 def print_summary(title, stats):
     """Helper to print stats summary"""
-    print("\n" + "-"*50)
-    print(f"Summary for: {title}")
+    border = f"{Colors.GRAY}{'-'*50}{Colors.RESET}"
+    print("\n" + border)
+    print(f"{Colors.BOLD}Summary for: {Colors.CYAN}{title}{Colors.RESET}")
     print(f"Files Scanned: {stats['processed']}")
-    print(f"Ignored:       {stats['ignored']}")
-    print(f"Updated:       {stats['updated']}")
-    print(f"Not Found:     {stats['not_found']}")
+    print(f"Ignored:       {Colors.GRAY}{stats['ignored']}{Colors.RESET}")
+    
+    # Updated (Green if > 0)
+    updated_color = Colors.GREEN if stats['updated'] > 0 else ""
+    print(f"Updated:       {updated_color}{stats['updated']}{Colors.RESET}")
+    
+    # Not Found (Yellow if > 0)
+    nf_color = Colors.YELLOW if stats['not_found'] > 0 else ""
+    print(f"Not Found:     {nf_color}{stats['not_found']}{Colors.RESET}")
+    
+    # Failed (Red if > 0)
     if stats['failed'] > 0:
-        print(f"Failed:        {stats['failed']}")
-    print("-"*50 + "\n")
+        print(f"Failed:        {Colors.RED}{stats['failed']}{Colors.RESET}")
+        
+    print(border + "\n")
 
 def scan_directory(directory, refetch_old=False):
     """文件掃描主函數 (支援子目錄總結)"""
-    print_log(f"Starting scan in: {directory}")
+    print_log(f"Starting scan in: {directory}", Colors.BLUE)
     
     global_stats = {
         "processed": 0, "ignored": 0, "updated": 0, "not_found": 0, "failed": 0
@@ -179,18 +227,18 @@ def scan_directory(directory, refetch_old=False):
         
         # 關鍵修改：確保這裡顯示的相對路徑是基於最上層的 directory
         relative_path = os.path.relpath(filepath, start=directory)
-        progress_prefix = f"[{counter[0]}]"
+        progress_prefix = f"{Colors.GRAY}[{counter[0]}]{Colors.RESET}"
 
         if not metadata_needed(filepath, refetch_old):
             stats_obj["ignored"] += 1
             return
             
-        print_log(f"{progress_prefix} Processing: {relative_path}")
+        print_log(f"{progress_prefix} Processing: {Colors.CYAN}{relative_path}", Colors.RESET)
         
         # 1. Hash
         model_hash = calculate_sha256(filepath)
         if not model_hash:
-            print_log(f"{progress_prefix} Failed hash: {relative_path}")
+            print_log(f"{progress_prefix} Failed hash: {relative_path}", Colors.RED)
             stats_obj["failed"] += 1
             return
             
@@ -200,12 +248,12 @@ def scan_directory(directory, refetch_old=False):
         
         is_skeleton = False
         if not info:
-            print_log(f"Model not found: {relative_path}")
+            print_log(f"Model not found: {relative_path}", Colors.YELLOW)
             info = create_skeleton_info(filepath, model_hash)
             is_skeleton = True
         else:
             model_name = info.get('model', {}).get('name', 'Unknown')
-            print_log(f"Found info: {model_name}")
+            print_log(f"Found info: {Colors.GREEN}{model_name}", Colors.RESET)
         
         # 3. Process & Save
         info = process_model_info(info, is_skeleton)
@@ -222,7 +270,7 @@ def scan_directory(directory, refetch_old=False):
     try:
         root_items = os.listdir(directory)
     except OSError as e:
-        print_log(f"Error listing directory: {e}")
+        print_log(f"Error listing directory: {e}", Colors.RED)
         return
 
     root_files = [os.path.join(directory, f) for f in root_items 
@@ -239,6 +287,9 @@ def scan_directory(directory, refetch_old=False):
 
     for subdir in subdirs:
         subdir_path = os.path.join(directory, subdir)
+        
+        print_log(f"Scanning subdirectory: {subdir}...", Colors.BLUE)
+        
         subdir_stats = {
             "processed": 0, "ignored": 0, "updated": 0, "not_found": 0, "failed": 0
         }
@@ -253,24 +304,12 @@ def scan_directory(directory, refetch_old=False):
         for k in global_stats:
             global_stats[k] += subdir_stats[k]
             
-        # 若有更新檔案 (updated 或 not_found 都算有變動，這裡可自定義是否顯示)
-        # 根據 USER REQUEST 先前的邏輯 "僅限於有更新檔案時"，這裡我們只對 updated > 0 做顯示
-        # 如果用戶希望 not_found 也顯示，可以改為 if subdir_stats["updated"] > 0 or subdir_stats["not_found"] > 0:
-        # 但遵循 "不包含在 update 內" 的指示，這裡我們先只針對有效更新顯示，或者我們可以認為 "變動" 就顯示
-        # 為了保險起見，若該目錄有新生成的資料 (不論是 real info 還是 skeleton)，建議都顯示
+        # 若有更新檔案，顯示該子目錄的總結
         if subdir_stats["updated"] > 0 or subdir_stats["not_found"] > 0:
             print_summary(subdir, subdir_stats)
 
     # 最終全域總結
-    print("\n" + "="*50)
-    print(f"Final Scan Summary for: {directory}")
-    print(f"Total Files Scanned: {global_stats['processed']}")
-    print(f"Files Ignored:       {global_stats['ignored']}")
-    print(f"Files Updated:       {global_stats['updated']}")
-    print(f"Models Not Found:    {global_stats['not_found']}")
-    if global_stats['failed'] > 0:
-        print(f"Files Failed:        {global_stats['failed']}")
-    print("="*50 + "\n")
+    print_summary(f"Final Count ({directory})", global_stats)
 
 def main():
     parser = argparse.ArgumentParser(description="Civitai Model Scanner CLI")
