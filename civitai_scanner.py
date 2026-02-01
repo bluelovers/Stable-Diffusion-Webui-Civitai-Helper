@@ -183,7 +183,7 @@ def metadata_needed(filepath, refetch_old):
     # 這裡可以加入版本檢查邏輯，但為了簡化CLI，預設存在即跳過
     return False
 
-def print_summary(title, stats):
+def print_summary(title, stats, scan_root=None):
     """Helper to print stats summary"""
     border = f"{Colors.GRAY}{'-'*50}{Colors.RESET}"
     print("\n" + border)
@@ -210,29 +210,28 @@ def print_summary(title, stats):
         print(f"Failed:        {Colors.RED}{stats['failed']}{Colors.RESET}")
 
     # 顯示重複檔案路徑 (分組顯示)
-    if dup_count > 0:
+    if dup_count > 0 and scan_root:
         print(f"\n{Colors.GRAY}[Duplicate Files List]{Colors.RESET}")
         
         # Group by hash
         groups = {}
         for item in stats['duplicates']:
-            # 兼容舊版僅有字串的情況 (防禦性編程) 或 新版 tuple (path, hash)
             if isinstance(item, tuple):
-                p, h = item
+                p_abs, h = item
                 short_h = h[:8]
                 if short_h not in groups:
                     groups[short_h] = []
-                groups[short_h].append(p)
-            else:
-                # Fallback for plain string
-                if "Unknown" not in groups:
-                    groups["Unknown"] = []
-                groups["Unknown"].append(item)
+                groups[short_h].append(p_abs)
         
         for h, paths in groups.items():
             print(f"  Hash: {Colors.BLUE}{h}...{Colors.RESET}")
-            for p in paths:
-                print(f"    - {p}")
+            for p_abs in paths:
+                try:
+                    p_rel = os.path.relpath(p_abs, start=scan_root)
+                    link_info = get_link_type(p_abs, scan_root)
+                    print(f"    - {p_rel}{link_info}")
+                except Exception:
+                    print(f"    - {p_abs}")
         
     print(border + "\n")
 
@@ -344,26 +343,16 @@ def scan_directory(directory, refetch_old=False):
             original_path_abs = cached_entry['path']
             original_path = os.path.relpath(original_path_abs, start=directory)
             
-            # Lazy detect link type for Original if missing
-            if 'link_type' not in cached_entry:
-                cached_entry['link_type'] = get_link_type(original_path_abs, directory)
-            original_link_type = cached_entry['link_type']
-            
-            # Detect link type for Current (duplicate)
-            current_link_type = get_link_type(filepath, directory)
-            
-            print_log(f"{progress_prefix} Duplicate detected{current_link_type} (Same as {original_path})", Colors.GRAY)
+            print_log(f"{progress_prefix} Duplicate detected (Same as {original_path})", Colors.GRAY)
             
             # Record duplicate with label
             if model_hash not in recorded_dup_originals:
                 # 將正本加入清單
-                label = f"{original_path}{original_link_type}"
-                stats_obj["duplicates"].append((label, model_hash))
+                stats_obj["duplicates"].append((original_path_abs, model_hash))
                 recorded_dup_originals.add(model_hash)
             
             # 將當前副本加入清單
-            current_label = f"{relative_path}{current_link_type}"
-            stats_obj["duplicates"].append((current_label, model_hash))
+            stats_obj["duplicates"].append((filepath, model_hash))
             
             info = cached_entry['data']
             if isinstance(info, dict):
@@ -375,7 +364,6 @@ def scan_directory(directory, refetch_old=False):
             hash_cache[model_hash] = {
                 'data': None,
                 'path': filepath,
-                # 'link_type': is NOT set initially
             }
 
         # Check if metadata update is needed
@@ -479,10 +467,10 @@ def scan_directory(directory, refetch_old=False):
         if (subdir_stats["updated"] > 0 or 
             subdir_stats["not_found"] > 0 or 
             len(subdir_stats["duplicates"]) > 0):
-            print_summary(subdir, subdir_stats)
+            print_summary(subdir, subdir_stats, directory)
 
     # 最終全域總結
-    print_summary(f"Final Count ({directory})", global_stats)
+    print_summary(f"Final Count ({directory})", global_stats, directory)
 
 def main():
     parser = argparse.ArgumentParser(description="Civitai Model Scanner CLI")
