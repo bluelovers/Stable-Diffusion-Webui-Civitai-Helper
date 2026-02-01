@@ -55,48 +55,48 @@ python civitai_scanner.py "D:\StableDiffusion\models" --refetch-only-not-found
 
 ```mermaid
 flowchart TD
-    Start([開始 Start]) --> Init[初始化 & 參數解析]
-    Init --> ScanDir{掃描目錄 Scan Directory}
+    Start([開始 Start]) --> Init["初始化 & 參數解析"]
+    Init --> ScanDir{"掃描目錄 Scan Directory"}
     
     subgraph ScanningLoop [掃描迴圈]
-        ScanDir -->|遍歷 Root Files| ProcessFile[處理檔案 Process File]
-        ScanDir -->|遍歷 Subdirs| WalkDir[os.walk 遞歸子目錄]
+        ScanDir -->|遍歷 Root Files| ProcessFile["處理檔案 Process File"]
+        ScanDir -->|遍歷 Subdirs| WalkDir["os.walk 遞歸子目錄"]
         WalkDir --> ProcessFile
     end
 
     subgraph FileProcessing [單檔處理邏輯]
-        ProcessFile --> CalcHash[計算/讀取 SHA256]
-        CalcHash --> CheckCache{Hash Cache 存在?}
+        ProcessFile --> CalcHash["計算/讀取 SHA256"]
+        CalcHash --> CheckCache{"Hash Cache 存在?"}
         
-        CheckCache -- Yes (Duplicate) --> LogDup[記錄重複檔案路徑]
-        LogDup --> Note[備註: 此時不檢查 Link Type (Lazy)]
+        CheckCache -- "Yes (Duplicate)" --> LogDup["記錄重複檔案路徑"]
+        LogDup --> Note["備註: 此時不檢查 Link Type (Lazy)"]
         
-        CheckCache -- No (New File) --> FetchAPI[Civitai API 請求]
-        FetchAPI --> GenInfo[生成/更新 .civitai.info]
-        GenInfo --> SaveCache[存入 Cache]
+        CheckCache -- "No (New File)" --> FetchAPI["Civitai API 請求"]
+        FetchAPI --> GenInfo["生成/更新 .civitai.info"]
+        GenInfo --> SaveCache["存入 Cache"]
     end
     
-    ProcessFile --> NextFile{還有檔案?}
+    ProcessFile --> NextFile{"還有檔案?"}
     NextFile -- Yes --> ProcessFile
     NextFile -- No --> Summary
     
     subgraph Reporting [報告與連結檢測]
-        Summary[準備總結報告] --> CheckDups{有無重複檔案?}
+        Summary["準備總結報告"] --> CheckDups{"有無重複檔案?"}
         
-        CheckDups -- Yes --> IterateDups[遍歷重複清單]
+        CheckDups -- Yes --> IterateDups["遍歷重複清單"]
         IterateDups --> DetectLink["調用 get_link_type (Cached)"]
         
-        DetectLink --> IsSymlink{Is Symlink?}
-        IsSymlink -- Yes --> RetSym[標記 Symlink]
-        IsSymlink -- No --> IsJunction{Is Junction?}
-        IsJunction -- Yes --> RetJun[標記 Junction]
-        IsJunction -- No --> IsHard{Is Hardlink?}
-        IsHard -- Yes --> RetHard[標記 Hardlink]
+        DetectLink --> IsSymlink{"Is Symlink?"}
+        IsSymlink -- Yes --> RetSym["標記 Symlink"]
+        IsSymlink -- No --> IsJunction{"Is Junction?"}
+        IsJunction -- Yes --> RetJun["標記 Junction"]
+        IsJunction -- No --> IsHard{"Is Hardlink?"}
+        IsHard -- Yes --> RetHard["標記 Hardlink"]
         
-        RetSym & RetJun & RetHard --> PrintLine[列印帶有標記的路徑]
+        RetSym & RetJun & RetHard --> PrintLine["列印帶有標記的路徑"]
         PrintLine --> IterateDups
         
-        IterateDups -->|結束| PrintStats[顯示最終統計數字]
+        IterateDups -->|結束| PrintStats["顯示最終統計數字"]
     end
     
     CheckDups -- No --> PrintStats
