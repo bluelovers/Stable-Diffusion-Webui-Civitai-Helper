@@ -237,42 +237,53 @@ def print_summary(title, stats, scan_root=None):
 
 def get_link_type(filepath, root_directory):
     """(Lazy) Detect link type for a specific file"""
-    link_type_str = ""
-    is_symlink = os.path.islink(filepath)
-    
-    if is_symlink:
-        link_type_str = f" {Colors.CYAN}(Symlink){Colors.RESET}"
-    else:
-        try:
-            st = os.stat(filepath)
-            if st.st_nlink > 1:
-                link_type_str = f" {Colors.CYAN}(Hardlink){Colors.RESET}"
-        except Exception:
-            pass
-    
-    # If not Symlink check if it's inside a Junction (parent traversal)
-    check_dir = os.path.dirname(filepath)
-    is_junction = False
     try:
-        abs_root = os.path.abspath(root_directory)
-        while check_dir and len(check_dir) >= len(abs_root):
-            if check_dir == abs_root:
-                break
-            if os.path.islink(check_dir):
-                is_junction = True
-                break
-            # Move up
-            parent = os.path.dirname(check_dir)
-            if parent == check_dir:
-                break
-            check_dir = parent
-    except Exception:
+        filepath = os.path.abspath(filepath)
+        root_directory = os.path.abspath(root_directory)
+    except:
+        return ""
+
+    if os.path.islink(filepath):
+        return f" {Colors.CYAN}(Symlink){Colors.RESET}"
+    
+    # Hardlink check
+    try:
+        st = os.stat(filepath)
+        # Only count hardlinks for files, not directories
+        if not os.path.isdir(filepath) and st.st_nlink > 1:
+            return f" {Colors.CYAN}(Hardlink){Colors.RESET}"
+    except:
         pass
 
-    if is_junction:
-        link_type_str += f" {Colors.CYAN}(Junction){Colors.RESET}"
+    # Junction/Link check in parents
+    check_dir = os.path.dirname(filepath)
+    root_norm = os.path.normcase(root_directory)
+    
+    while True:
+        # Check if current dir is a link/junction
+        if os.path.islink(check_dir):
+            return f" {Colors.CYAN}(Junction){Colors.RESET}"
+            
+        # Stop if we strictly reached the scan root
+        if os.path.normcase(check_dir) == root_norm:
+            break
+            
+        # Move up
+        parent = os.path.dirname(check_dir)
         
-    return link_type_str
+        # Stop if we hit filesystem root (parent is same as check_dir)
+        if parent == check_dir:
+            break
+            
+        # Stop if we somehow went 'above' root (should only happen if file wasn't inside root)
+        if len(parent) < len(root_directory):
+             # Double check if we are really outside root
+             if not os.path.normcase(check_dir).startswith(root_norm):
+                 break
+
+        check_dir = parent
+
+    return ""
 
 def scan_directory(directory, refetch_old=False):
     """文件掃描主函數 (支援子目錄總結)"""
