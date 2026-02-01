@@ -145,54 +145,124 @@ def metadata_needed(filepath, refetch_old):
     # 這裡可以加入版本檢查邏輯，但為了簡化CLI，預設存在即跳過
     return False
 
+def print_summary(title, stats):
+    """Helper to print stats summary"""
+    print("\n" + "-"*50)
+    print(f"Summary for: {title}")
+    print(f"Files Scanned: {stats['processed']}")
+    print(f"Ignored:       {stats['ignored']}")
+    print(f"Updated:       {stats['updated']}")
+    if stats['failed'] > 0:
+        print(f"Failed:        {stats['failed']}")
+    print("-"*50 + "\n")
+
 def scan_directory(directory, refetch_old=False):
-    """遞歸掃描目錄"""
+    """文件掃描主函數 (支援子目錄總結)"""
     print_log(f"Starting scan in: {directory}")
     
-    count_total = 0
-    count_processed = 0
+    global_stats = {
+        "processed": 0, "ignored": 0, "updated": 0, "failed": 0
+    }
     
-    for root, _, files in os.walk(directory):
-        for file in files:
-            filepath = os.path.join(root, file)
-            _, ext = os.path.splitext(file)
+    # 使用 mutable list 來讓內嵌函式修改計數
+    counter = [0] 
+
+    def process_file(filepath, stats_obj):
+        """處理單個文件的邏輯"""
+        _, ext = os.path.splitext(filepath)
+        if ext not in EXTS:
+            return
+
+        counter[0] += 1
+        stats_obj["processed"] += 1
+        
+        relative_path = os.path.relpath(filepath, directory)
+        progress_prefix = f"[{counter[0]}]"
+
+        if not metadata_needed(filepath, refetch_old):
+            stats_obj["ignored"] += 1
+            return
             
-            if ext not in EXTS:
-                continue
-                
-            count_total += 1
+        print_log(f"{progress_prefix} Processing: {relative_path}")
+        
+        # 1. Hash
+        model_hash = calculate_sha256(filepath)
+        if not model_hash:
+            print_log(f"{progress_prefix} Failed hash: {relative_path}")
+            stats_obj["failed"] += 1
+            return
             
-            if not metadata_needed(filepath, refetch_old):
-                continue
+        # 2. API
+        time.sleep(DELAY)
+        info = get_model_info_from_civitai(model_hash)
+        
+        is_skeleton = False
+        if not info:
+            print_log(f"Model not found: {relative_path}")
+            info = create_skeleton_info(filepath, model_hash)
+            is_skeleton = True
+        else:
+            model_name = info.get('model', {}).get('name', 'Unknown')
+            print_log(f"Found info: {model_name}")
+        
+        # 3. Process & Save
+        info = process_model_info(info, is_skeleton)
+        if save_info_file(filepath, info):
+            stats_obj["updated"] += 1
+        else:
+            stats_obj["failed"] += 1
+
+    # 1. 處理根目錄下的文件 (非遞歸)
+    try:
+        root_items = os.listdir(directory)
+    except OSError as e:
+        print_log(f"Error listing directory: {e}")
+        return
+
+    root_files = [os.path.join(directory, f) for f in root_items 
+                  if os.path.isfile(os.path.join(directory, f))]
+    
+    # 根目錄文件統計 (合併到 global，不單獨顯示除非有需求，這裡依照需求只對子目錄顯示)
+    # 不過為了統計準確，我們直接操作 global_stats
+    for f in root_files:
+        process_file(f, global_stats)
+
+    # 2. 處理第一級子目錄
+    subdirs = [d for d in root_items 
+               if os.path.isdir(os.path.join(directory, d))]
+    
+    # 按名稱排序，保持順序一致
+    subdirs.sort()
+
+    for subdir in subdirs:
+        subdir_path = os.path.join(directory, subdir)
+        subdir_stats = {
+            "processed": 0, "ignored": 0, "updated": 0, "failed": 0
+        }
+        
+        # 對該子目錄進行遞歸掃描
+        for root, _, files in os.walk(subdir_path):
+            for file in files:
+                filepath = os.path.join(root, file)
+                process_file(filepath, subdir_stats)
+        
+        # 將子目錄統計合併到全域
+        for k in global_stats:
+            global_stats[k] += subdir_stats[k]
             
-            print_log(f"Processing: {file}")
-            
-            # 1. 計算 Hash
-            model_hash = calculate_sha256(filepath)
-            if not model_hash:
-                continue
-                
-            # 2. 查詢 Civitai
-            time.sleep(DELAY) # 防 DDoS
-            info = get_model_info_from_civitai(model_hash)
-            
-            is_skeleton = False
-            if not info:
-                print_log(f"Model not found on Civitai: {file}")
-                # 3a. 創建 Dummy Info
-                info = create_skeleton_info(filepath, model_hash)
-                is_skeleton = True
-            else:
-                print_log(f"Found model info: {info.get('model', {}).get('name', 'Unknown')}")
-            
-            # 4. 處理數據
-            info = process_model_info(info, is_skeleton)
-            
-            # 5. 保存文件
-            if save_info_file(filepath, info):
-                count_processed += 1
-                
-    print_log(f"Scan complete. Processed {count_processed}/{count_total} models.")
+        # 需求：若有更新檔案，顯示該子目錄的總結
+        if subdir_stats["updated"] > 0:
+            print_summary(subdir, subdir_stats)
+
+    # 最終全域總結
+    print("\n" + "="*50)
+    print(f"Final Scan Summary for: {directory}")
+    print(f"Total Files Scanned: {global_stats['processed']}")
+    print(f"Files Ignored:       {global_stats['ignored']}")
+    print(f"Files Updated:       {global_stats['updated']}")
+    if global_stats['failed'] > 0:
+        print(f"Files Failed:        {global_stats['failed']}")
+    print("="*50 + "\n")
 
 def main():
     parser = argparse.ArgumentParser(description="Civitai Model Scanner CLI")
