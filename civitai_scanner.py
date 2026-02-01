@@ -200,11 +200,6 @@ def print_summary(title, stats):
     dup_color = Colors.BLUE if dup_count > 0 else ""
     print(f"Duplicates:    {dup_color}{dup_count}{Colors.RESET}")
     
-    # Links
-    if stats.get('symlinks', 0) > 0:
-        print(f"Symlinks:      {Colors.CYAN}{stats['symlinks']}{Colors.RESET}")
-    if stats.get('hardlinks', 0) > 0:
-        print(f"Hardlinks:     {Colors.CYAN}{stats['hardlinks']}{Colors.RESET}")
     
     # Not Found (Yellow if > 0)
     nf_color = Colors.YELLOW if stats['not_found'] > 0 else ""
@@ -241,14 +236,52 @@ def print_summary(title, stats):
         
     print(border + "\n")
 
+def get_link_type(filepath, root_directory):
+    """(Lazy) Detect link type for a specific file"""
+    link_type_str = ""
+    is_symlink = os.path.islink(filepath)
+    
+    if is_symlink:
+        link_type_str = f" {Colors.CYAN}(Symlink){Colors.RESET}"
+    else:
+        try:
+            st = os.stat(filepath)
+            if st.st_nlink > 1:
+                link_type_str = f" {Colors.CYAN}(Hardlink){Colors.RESET}"
+        except Exception:
+            pass
+    
+    # If not Symlink check if it's inside a Junction (parent traversal)
+    check_dir = os.path.dirname(filepath)
+    is_junction = False
+    try:
+        abs_root = os.path.abspath(root_directory)
+        while check_dir and len(check_dir) >= len(abs_root):
+            if check_dir == abs_root:
+                break
+            if os.path.islink(check_dir):
+                is_junction = True
+                break
+            # Move up
+            parent = os.path.dirname(check_dir)
+            if parent == check_dir:
+                break
+            check_dir = parent
+    except Exception:
+        pass
+
+    if is_junction:
+        link_type_str += f" {Colors.CYAN}(Junction){Colors.RESET}"
+        
+    return link_type_str
+
 def scan_directory(directory, refetch_old=False):
     """文件掃描主函數 (支援子目錄總結)"""
     print_log(f"Starting scan in: {directory}", Colors.BLUE)
     
     global_stats = {
         "processed": 0, "ignored": 0, "updated": 0, 
-        "not_found": 0, "failed": 0, "duplicates": [],
-        "symlinks": 0, "hardlinks": 0
+        "not_found": 0, "failed": 0, "duplicates": []
     }
     
     # 使用 mutable list 來讓內嵌函式修改計數
@@ -272,23 +305,7 @@ def scan_directory(directory, refetch_old=False):
         relative_path = os.path.relpath(filepath, start=directory)
         progress_prefix = f"{Colors.GRAY}[{counter[0]}]{Colors.RESET}"
         
-        # 檢測連結類型 (用於日誌和緩存)
-        # 注意: 這裡的 link_type_str 包含顏色代碼，直接用於顯示
-        link_type_str = ""
-        is_symlink = os.path.islink(filepath)
         
-        if is_symlink:
-            stats_obj["symlinks"] = stats_obj.get("symlinks", 0) + 1
-            link_type_str = f" {Colors.CYAN}(Symlink){Colors.RESET}"
-        else:
-            try:
-                st = os.stat(filepath)
-                if st.st_nlink > 1:
-                    stats_obj["hardlinks"] = stats_obj.get("hardlinks", 0) + 1
-                    link_type_str = f" {Colors.CYAN}(Hardlink){Colors.RESET}"
-            except Exception:
-                pass
-
         # 0. 嘗試從現有元數據讀取 Hash (優化效能)
         model_hash = None
         base, _ = os.path.splitext(filepath)
@@ -326,19 +343,26 @@ def scan_directory(directory, refetch_old=False):
             cached_entry = hash_cache[model_hash]
             original_path_abs = cached_entry['path']
             original_path = os.path.relpath(original_path_abs, start=directory)
-            original_link_type = cached_entry.get('link_type', '') # 獲取正本的連結類型
             
-            print_log(f"{progress_prefix} Duplicate detected{link_type_str} (Same as {original_path})", Colors.GRAY)
+            # Lazy detect link type for Original if missing
+            if 'link_type' not in cached_entry:
+                cached_entry['link_type'] = get_link_type(original_path_abs, directory)
+            original_link_type = cached_entry['link_type']
+            
+            # Detect link type for Current (duplicate)
+            current_link_type = get_link_type(filepath, directory)
+            
+            print_log(f"{progress_prefix} Duplicate detected{current_link_type} (Same as {original_path})", Colors.GRAY)
             
             # Record duplicate with label
             if model_hash not in recorded_dup_originals:
-                # 將正本加入清單 (包含其類型標示)
+                # 將正本加入清單
                 label = f"{original_path}{original_link_type}"
                 stats_obj["duplicates"].append((label, model_hash))
                 recorded_dup_originals.add(model_hash)
             
-            # 將當前副本加入清單 (包含其類型標示)
-            current_label = f"{relative_path}{link_type_str}"
+            # 將當前副本加入清單
+            current_label = f"{relative_path}{current_link_type}"
             stats_obj["duplicates"].append((current_label, model_hash))
             
             info = cached_entry['data']
@@ -347,10 +371,11 @@ def scan_directory(directory, refetch_old=False):
 
         else:
             # First time seeing this hash
+            # Initial entry does NOT calculate link type to save performance (Lazy)
             hash_cache[model_hash] = {
                 'data': None,
                 'path': filepath,
-                'link_type': link_type_str # 存儲類型標示供後續副本使用
+                # 'link_type': is NOT set initially
             }
 
         # Check if metadata update is needed
@@ -434,12 +459,11 @@ def scan_directory(directory, refetch_old=False):
         
         subdir_stats = {
             "processed": 0, "ignored": 0, "updated": 0, 
-            "not_found": 0, "failed": 0, "duplicates": [],
-            "symlinks": 0, "hardlinks": 0
+            "not_found": 0, "failed": 0, "duplicates": []
         }
         
-        # 對該子目錄進行遞歸掃描
-        for root, _, files in os.walk(subdir_path):
+        # 對該子目錄進行遞歸掃描 (啟用 followlinks 以進入 junction)
+        for root, _, files in os.walk(subdir_path, followlinks=True):
             for file in files:
                 filepath = os.path.join(root, file)
                 process_file(filepath, subdir_stats)
