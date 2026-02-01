@@ -55,8 +55,15 @@ class VersionMismatchException(Exception):
 
 def get_model_info_paths(model_path):
     """
-    Retrieve model info paths
-    return: (info_file:str, sd15_file:str)
+    獲取模型關聯的資訊文件路徑。
+    
+    參數:
+        model_path (str): 模型文件的路徑
+        
+    返回:
+        tuple: (info_file, sd15_file)
+            info_file: 插件專用的元數據文件 (.civitai.info)
+            sd15_file: SD WebUI 原生支持的元數據文件 (.json)
     """
     base, _ = os.path.splitext(model_path)
     info_file = f"{base}{civitai.SUFFIX}{CIVITAI_EXT}"
@@ -155,7 +162,16 @@ def locate_model_from_partial(root, model_name):
 
 
 def metadata_needed(info_file, sd15_file, refetch_old):
-    """ return True if metadata is needed
+    """ 
+    判斷是否需要獲取元數據。
+    
+    邏輯：
+    1. 檢查文件是否存在。
+    2. 如果存在且 refetch_old 為 True，則檢查元數據版本是否過舊。
+    3. 如果是 "部分元數據" (WebUI 用戶創建的)，也可能需要更新。
+    
+    返回:
+        bool: True 表示需要獲取/更新元數據
     """
 
     need_civitai = metadata_needed_for_type(info_file, "civitai", refetch_old)
@@ -235,18 +251,22 @@ def write_info(data, path, info_type):
 
 def process_model_info(model_path, model_info, model_type="ckp", refetch_old=False):
     """
-    Write model info to file
+    將模型資訊寫入到文件中。
+    這是元數據持久化的核心函數。
 
-    SD1.5 Webui added saving model information to JSON files.
-    Much of this extension's metadata management is replicated
-    by this new functionality, including automatically adding
-    activator keywords to the prompt. It also provides a much
-    cleaner UI than civitai (not a high bar to clear) to
-    simply read a model's description.
+    功能：
+    1. 處理並清理 HTML 描述。
+    2. 添加插件的版本訊息 (用於日後檢查是否過期)。
+    3. 下載模型預覽圖 (Example Images) 到本地 (如果啟用了 ch_download_examples)。
+    4. 寫入 .civitai.info 文件 (完整元數據)。
+    5. 寫入 .json 文件 (SD WebUI 原生支持的精簡元數據)。
 
-    So why not populate it with useful information?
+    SD1.5 Webui 新增了將模型資訊保存為 JSON 文件的功能。
+    此函數會自動填充觸發詞 (Activator keywords)、描述等資訊，
+    讓用戶在 WebUI 的模型卡片中能直接看到。
 
-    Returns True if successful, otherwise an error message.
+    返回:
+        True 如果成功，否則返回錯誤訊息。
     """
 
     if model_info is None:

@@ -15,7 +15,11 @@ from . import templates
 
 def get_metadata_skeleton():
     """
-    Used to generate at least something when model is not on civitai.
+    生成一個基礎的、空的元數據骨架。
+    當模型在 Civitai 上找不到時，或者是為了保持數據結構一致性時使用。
+    
+    返回:
+        dict: 包含預設字段的字典結構
     """
     metadata = {
         "id": "",
@@ -51,29 +55,44 @@ def get_metadata_skeleton():
 
 def scan_single_model(filepath, model_type, refetch_old, organize_models, delay):
     """
-    Gets model info for a model by feeding its sha256 hash into civitai's api
+    單個模型掃描的核心邏輯：
+    1. 計算模型文件的 SHA256 哈希值
+    2. 使用哈希值向 Civitai API 查詢模型資訊
+    
+    參數:
+        filepath: 模型文件的絕對路徑
+        model_type: 模型類型 (如 'ckp', 'lora' 等)
+        refetch_old: 是否強制重新獲取舊的元數據
+        organize_models: 是否根據模型類型將文件移動到子文件夾
+        delay: API 請求後的延遲時間 (秒)
 
-    return: success:bool
+    返回:
+        生成器，逐步返回執行狀態 (字串或布林值)
     """
 
     filename = os.path.basename(filepath)
 
-    # find a model, get info file
+    # 獲取關聯的資訊文件路徑 (.civitai.info 和 WebUI 的 .json)
+    # 用於檢查元數據是否已存在
     info_file, sd15_file = model.get_model_info_paths(filepath)
 
     output = ""
 
+    # 檢查是否啟用了 AutoV3 哈希算法 (前12位字節)
     use_auto_v3 = util.get_opts("ch_autov3")
 
-    # check info file
+    # 判斷是否需要獲取元數據
+    # 如果元數據文件不存在，或者 refetch_old 為 True 且元數據版本較舊，則需要獲取
     if model.metadata_needed(info_file, sd15_file, refetch_old):
         output = f"Creating model info for: {filename}"
         util.printD(output)
         yield output
 
-        # get model's sha256
+        # 計算模型的 SHA256 哈希值
+        # 這是一個耗時操作，也是識別模型的關鍵
         result = None
         for result in util.gen_file_sha256(filepath, use_addnet_hash=use_auto_v3):
+            # 如果還是 tuple，說明是進度更新
             if isinstance(result, tuple):
                 yield result
 
@@ -81,6 +100,7 @@ def scan_single_model(filepath, model_type, refetch_old, organize_models, delay)
 
         util.printD(f"model action sha256: {sha256_hash}")
 
+        # 如果無法生成哈希值，則失敗
         if not sha256_hash:
             output = f"failed generating SHA256 for model: {filename}"
             util.printD(output)
@@ -88,26 +108,34 @@ def scan_single_model(filepath, model_type, refetch_old, organize_models, delay)
             time.sleep(delay)
             yield False
 
+        # 準備用於 Civitai 查詢的哈希值
         civitai_hash = sha256_hash
         if use_auto_v3:
+            # AutoV3 只需要前 12 個字符
             civitai_hash = sha256_hash[:12]
 
         yield "Requesting model information from Civitai"
-        # use this sha256 to get model info from civitai
+        
+        # 使用哈希值從 Civitai API 獲取模型詳細資訊
         model_info = civitai.get_model_info_by_hash(civitai_hash)
 
+        # 如果 Civitai 上找不到該模型
         if not model_info:
+            # 創建一個空的/虛擬的模型資訊，僅包含本地可獲取的基本資訊
             model_info = dummy_model_info(filepath, civitai_hash, model_type)
+            # 即使找不到也視為成功，因為我們至少生成了本地資訊
             yield True
 
-        # if model is lora and not already in a subfolder, move into subfolder based on its type (character,
-        # clothing, etc.)
+        # 如果需要整理模型 (通常針對 Lora/Lycoris)
+        # 且模型尚未在子資料夾中，根據資訊將其移動到分類子資料夾 (如 character, style 等)
         if organize_models and model_type in ["lora", "lycoris"]:
             filepath = civitai.move_model_to_subfolder(filepath, model_info)
 
+        # 處理並保存模型資訊到文件
+        # 這會寫入 .civitai.info 和 WebUI 的 .json 文件
         model.process_model_info(filepath, model_info, model_type, refetch_old=refetch_old)
 
-        # delay before next request, to prevent being treated as a DDoS attack
+        # 為了避免觸發 Civitai 的反 DDoS 保護，請求後進行短暫延遲
         time.sleep(delay)
 
     else:
@@ -117,8 +145,15 @@ def scan_single_model(filepath, model_type, refetch_old, organize_models, delay)
 
 
 def scan_model(scan_model_types, refetch_old, organize_models=False, progress=gr.Progress()):
-    """ Scan model to generate SHA256, then use this SHA256 to get model info from civitai
-        return output msg
+    """
+    掃描模型的主函數：
+    遍歷指定類型的所有模型，生成 SHA256，並從 Civitai 獲取資訊。
+    
+    參數:
+        scan_model_types: 要掃描的模型類型列表 (或單個類型字串)
+        refetch_old: 是否強制更新現有元數據
+        organize_models: 是否整理模型文件結構
+        progress: Gradio 的進度條實例
     """
 
     delay = 0.2
@@ -126,11 +161,11 @@ def scan_model(scan_model_types, refetch_old, organize_models=False, progress=gr
     util.printD("Start scan_model")
     output = ""
 
+    # 用於預覽圖處理的設置
     nsfw_preview_threshold = util.get_opts("ch_nsfw_threshold")
-
     max_size_preview = util.get_opts("ch_max_size_preview")
 
-    # check model types
+    # 檢查是否指定了模型類型
     if not scan_model_types:
         output = "Model Types is None, can not scan."
         util.printD(output)
@@ -139,33 +174,38 @@ def scan_model(scan_model_types, refetch_old, organize_models=False, progress=gr
 
     model_types = scan_model_types
     if isinstance(scan_model_types, str):
-        # check if type is a string
+        # 如果是單個字串，轉換為列表
         model_types = [scan_model_types]
 
+    # 第一階段：收集所有需要掃描的模型文件
     models = []
     for model_type, model_folder in model.folders.items():
         if model_type not in model_types:
             continue
 
         util.printD(f"Scanning path: {model_folder}")
+        # 遞歸遍歷目錄
         for root, _, files in os.walk(model_folder, followlinks=True):
             for filename in files:
-
-                # check ext
                 filepath = os.path.join(root, filename)
+                # 檢查副檔名是否為支持的模型格式
                 _, ext = os.path.splitext(filepath)
                 if ext not in model.EXTS:
                     continue
-
+                
+                # 記錄文件路徑和對應的模型類型
                 models.append((filepath, model_type))
 
-    count = [0, 0]
+    # 第二階段：逐個處理模型
+    count = [0, 0] # [已掃描總數, 成功處理數]
     total = len(models)
+    
     for filepath, model_type in models:
         success = None
 
         tracker = (count[0], total)
 
+        # 更新 UI 進度條
         progress(
             tracker,
             desc="Scanning...",
@@ -174,26 +214,32 @@ def scan_model(scan_model_types, refetch_old, organize_models=False, progress=gr
 
         count[0] = count[0] + 1
 
+        # 調用 scan_single_model 處理單個模型
+        # scan_single_model 是一個生成器，會返回狀態更新
         for result in scan_single_model(filepath, model_type, refetch_old, organize_models, delay):
+            # 如果返回字串，視為狀態描述更新
             if isinstance(result, str):
                 progress(tracker, desc=result, unit="models")
                 continue
 
+            # 如果返回元組，通常是 SHA256 計算進度 (百分比, 狀態)
             if isinstance(result, tuple):
                 percent, status = result
                 progress(percent, desc=status)
                 continue
 
+            # 用於判斷單個模型處理是否最終成功
             success = result
             break
 
         if not success:
             continue
 
-        # set model_count
+        # 增加成功計數
         count[1] = count[1] + 1
 
-        # check preview image
+        # 第三階段：檢查並下載預覽圖
+        # 即使模型資訊獲取成功，我們也需要確保有預覽圖
         for _ in civitai.get_preview_image_by_model_path(
             filepath,
             max_size_preview,
@@ -201,7 +247,7 @@ def scan_model(scan_model_types, refetch_old, organize_models=False, progress=gr
         ):
             pass
 
-    # this previously had an image count, but it always matched the model count.
+    # 掃描結束總結
     output = f"Done. Successfully scanned {count[1]} of {len(models)} models."
 
     util.printD(output)
@@ -211,7 +257,17 @@ def scan_model(scan_model_types, refetch_old, organize_models=False, progress=gr
 
 def dummy_model_info(path, sha256_hash, model_type):
     """
-    Fills model metadata with information we can get locally.
+    當 Civitai 上找不到模型時（或是私有模型），創建一個本地的虛擬模型資訊。
+    這很重要，可以用來標記該文件"已被掃描過"，避免下次重複計算哈希。
+    同時嘗試從 Safetensors 文件的頭部讀取訓練元數據（如果有的話）。
+
+    參數:
+        path: 模型路徑
+        sha256_hash: 模型的哈希值
+        model_type: 模型類型
+
+    返回:
+        dict: 填充了基本訊息的模型元數據字典
     """
     if not sha256_hash:
         return {}
@@ -233,16 +289,16 @@ def dummy_model_info(path, sha256_hash, model_type):
     file_metadata["hashes"]["SHA256"] = sha256_hash
     file_metadata["hashes"]["AutoV2"] = autov2
 
-    # We can't get data on the model from civitai, but some models
-    # do store their training data.
+    # 我們無法從 civitai 獲取數據，但有些 safetensors 模型文件本身
+    # 存儲了訓練數據 (User Meta)。
     trained_words = model_info["trainedWords"]
     tags = model_info["tags"]
 
     try:
         read_metadata = sd_models.read_metadata_from_safetensors(path)
     except AssertionError:
-        # model is not a safetensors file. This is fine,
-        # it just doesn't have metadata we can read
+        # 模型不是 safetensors 文件。這很正常，
+        # 只是意味著我們沒有可讀取的元數據
         return model_info
 
     tag_frequency = read_metadata.get("ss_tag_frequency", {})
@@ -251,15 +307,15 @@ def dummy_model_info(path, sha256_hash, model_type):
 
     if isinstance(tag_frequency, dict):
         for trained_word in tag_frequency.keys():
-            # kohya training scripts use
-            # `{iterations}_{trained_word}`
-            # for training finetune concepts.
+            # kohya 訓練腳本使用 `{iterations}_{trained_word}`
+            # 來命名微調訓練概念。
+            # 我們需要移除前面的迭代次數數字。
             word = prefix_re.sub("", trained_word)
             trained_words.append(word)
 
-            # "tags" in this case are just words used in image captions
-            # when training the finetune model.
-            # They may or may not be useful for prompting
+            # 在這種情況下 "tags" 只是在訓練微調模型時
+            # 圖片標註(caption)中使用的單詞。
+            # 它們對提示詞(prompting)可能有用，也可能沒用。
             for tag in tag_frequency[trained_word].keys():
                 tag = tag.replace(",", "").strip()
                 if tag == "" or tag in tags:

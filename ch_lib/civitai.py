@@ -130,12 +130,16 @@ def append_parent_model_metadata(content):
 
 def get_model_info_by_hash(model_hash: str):
     """
-    use this sha256 to get model info from civitai's api
-
-    return:
-        model info dict if a model is found
-        {} if civitai does not have the model
-        None if an error occurs.
+    使用 SHA256 哈希值從 Civitai API 獲取模型資訊。
+    這是 scan_model 中最關鍵的 API 調用。
+    
+    參數:
+        model_hash (str): 模型的 SHA256 哈希值
+        
+    返回:
+        dict: 若成功找到模型，返回包含模型詳細資訊的字典。
+        {}: 若 Civitai 上沒有該模型 (404)。
+        None: 若發生錯誤。
     """
     util.printD("Request model info from civitai")
 
@@ -452,8 +456,18 @@ def verify_preview(path, img_dict, max_size_preview, nsfw_preview_threshold):
 # image will be saved to file, so no return
 def get_preview_image_by_model_path(model_path: str, max_size_preview, nsfw_preview_threshold, preferred_preview=None):
     """
-    Downloads a preview image for a model if one doesn't already exist.
-    Skips images that are more NSFW than the user's NSFW threshold
+    如果預覽圖不存在，則下載模型的預覽圖。
+    
+    邏輯：
+    1. 檢查本地是否已有預覽圖 (`.preview.png` 或 `.png` 等)。
+    2. 讀取 `.civitai.info` 元數據中的圖片列表。
+    3. 根據 NSFW 閾值過濾圖片 (例如跳過 'X' 或 'XXX' 級別的圖片)。
+    4. 下載第一張符合條件的圖片作為預覽圖。
+    
+    參數:
+        model_path: 模型路徑
+        max_size_preview: 是否使用最大尺寸 (True/False)
+        nsfw_preview_threshold: NSFW 過濾等級
     """
     util.printD("Downloading model image.")
 
@@ -757,6 +771,19 @@ def check_models_new_version_by_model_types(model_types: list, delay: float = 0.
 
 
 def move_model_to_subfolder(filepath, model_info):
+    """
+    根據模型在 Civitai 上的標籤 (Categories) 將模型移動到對應的子文件夾。
+    主要用於整理 Lora 和 Lycoris 模型。
+    
+    邏輯：
+    1. 獲取模型的標籤列表。
+    2. 檢查是否有標籤匹配預定義的 MODEL_CATEGORIES (如 style, character, vehicle 等)。
+    3. 如果匹配，創建該子文件夾 (如果不存在)。
+    4. 將文件移動到該子文件夾中。
+    
+    返回:
+        str: 新的文件路徑 (如果移動了)，或原路徑 (如果未移動/出錯)。
+    """
     model_id = model_info["modelId"]
 
     if model_id == "":

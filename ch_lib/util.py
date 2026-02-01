@@ -155,7 +155,19 @@ def get_opts(key):
 
 
 def gen_file_sha256(filename:str, model_type="lora", use_addnet_hash=False) -> str:
-    """ return a sha256 hash for a file """
+    """
+    生成文件的 SHA256 哈希值。
+    優先嘗試從緩存中獲取，如果緩存未命中，則計算新的哈希值並更新緩存。
+
+    參數:
+        filename: 文件路徑
+        model_type: 模型類型 (用於緩存鍵名生成)
+        use_addnet_hash: 是否使用 AutoV2 (AddNet) 算法 (僅計算前 1 048 576 bytes)
+                         這對於大型模型 (Checkpoints) 來說速度快很多。
+    
+    返回:
+        生成器，逐步返回計算進度或最終的哈希值。
+    """
 
     cache = sha256_cache.cache
     dump_cache = sha256_cache.dump_cache
@@ -196,7 +208,12 @@ def gen_file_sha256(filename:str, model_type="lora", use_addnet_hash=False) -> s
     yield sha256_value
 
 def calculate_sha256(model_file, use_addnet_hash=False):
-    """ calculate the sha256 hash for a model file """
+    """ 
+    實際執行 SHA256 計算的函數。
+    以分塊 (Chunk) 方式讀取文件以節省記憶體，並支持進度回報。
+    
+    如果 use_addnet_hash 為 True，則會跳過頭部字節並只讀取特定長度。
+    """
 
     blocksize= 1 << 20
     sha256_hash = hashlib.sha256()
