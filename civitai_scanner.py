@@ -152,6 +152,7 @@ def print_summary(title, stats):
     print(f"Files Scanned: {stats['processed']}")
     print(f"Ignored:       {stats['ignored']}")
     print(f"Updated:       {stats['updated']}")
+    print(f"Not Found:     {stats['not_found']}")
     if stats['failed'] > 0:
         print(f"Failed:        {stats['failed']}")
     print("-"*50 + "\n")
@@ -161,7 +162,7 @@ def scan_directory(directory, refetch_old=False):
     print_log(f"Starting scan in: {directory}")
     
     global_stats = {
-        "processed": 0, "ignored": 0, "updated": 0, "failed": 0
+        "processed": 0, "ignored": 0, "updated": 0, "not_found": 0, "failed": 0
     }
     
     # 使用 mutable list 來讓內嵌函式修改計數
@@ -176,7 +177,8 @@ def scan_directory(directory, refetch_old=False):
         counter[0] += 1
         stats_obj["processed"] += 1
         
-        relative_path = os.path.relpath(filepath, directory)
+        # 關鍵修改：確保這裡顯示的相對路徑是基於最上層的 directory
+        relative_path = os.path.relpath(filepath, start=directory)
         progress_prefix = f"[{counter[0]}]"
 
         if not metadata_needed(filepath, refetch_old):
@@ -207,8 +209,12 @@ def scan_directory(directory, refetch_old=False):
         
         # 3. Process & Save
         info = process_model_info(info, is_skeleton)
+        
         if save_info_file(filepath, info):
-            stats_obj["updated"] += 1
+            if is_skeleton:
+                stats_obj["not_found"] += 1
+            else:
+                stats_obj["updated"] += 1
         else:
             stats_obj["failed"] += 1
 
@@ -222,8 +228,6 @@ def scan_directory(directory, refetch_old=False):
     root_files = [os.path.join(directory, f) for f in root_items 
                   if os.path.isfile(os.path.join(directory, f))]
     
-    # 根目錄文件統計 (合併到 global，不單獨顯示除非有需求，這裡依照需求只對子目錄顯示)
-    # 不過為了統計準確，我們直接操作 global_stats
     for f in root_files:
         process_file(f, global_stats)
 
@@ -231,13 +235,12 @@ def scan_directory(directory, refetch_old=False):
     subdirs = [d for d in root_items 
                if os.path.isdir(os.path.join(directory, d))]
     
-    # 按名稱排序，保持順序一致
     subdirs.sort()
 
     for subdir in subdirs:
         subdir_path = os.path.join(directory, subdir)
         subdir_stats = {
-            "processed": 0, "ignored": 0, "updated": 0, "failed": 0
+            "processed": 0, "ignored": 0, "updated": 0, "not_found": 0, "failed": 0
         }
         
         # 對該子目錄進行遞歸掃描
@@ -250,8 +253,12 @@ def scan_directory(directory, refetch_old=False):
         for k in global_stats:
             global_stats[k] += subdir_stats[k]
             
-        # 需求：若有更新檔案，顯示該子目錄的總結
-        if subdir_stats["updated"] > 0:
+        # 若有更新檔案 (updated 或 not_found 都算有變動，這裡可自定義是否顯示)
+        # 根據 USER REQUEST 先前的邏輯 "僅限於有更新檔案時"，這裡我們只對 updated > 0 做顯示
+        # 如果用戶希望 not_found 也顯示，可以改為 if subdir_stats["updated"] > 0 or subdir_stats["not_found"] > 0:
+        # 但遵循 "不包含在 update 內" 的指示，這裡我們先只針對有效更新顯示，或者我們可以認為 "變動" 就顯示
+        # 為了保險起見，若該目錄有新生成的資料 (不論是 real info 還是 skeleton)，建議都顯示
+        if subdir_stats["updated"] > 0 or subdir_stats["not_found"] > 0:
             print_summary(subdir, subdir_stats)
 
     # 最終全域總結
@@ -260,6 +267,7 @@ def scan_directory(directory, refetch_old=False):
     print(f"Total Files Scanned: {global_stats['processed']}")
     print(f"Files Ignored:       {global_stats['ignored']}")
     print(f"Files Updated:       {global_stats['updated']}")
+    print(f"Models Not Found:    {global_stats['not_found']}")
     if global_stats['failed'] > 0:
         print(f"Files Failed:        {global_stats['failed']}")
     print("="*50 + "\n")
