@@ -20,6 +20,7 @@ import hashlib
 import argparse
 import requests
 from datetime import datetime
+from functools import lru_cache
 
 # 配置
 CIVITAI_API_URL = "https://civitai.com/api/v1/model-versions/by-hash/"
@@ -236,6 +237,7 @@ def print_summary(title, stats, scan_root=None):
         
     print(border + "\n")
 
+@lru_cache(maxsize=None)
 def is_junction_or_link(path):
     """
     在 Windows 上用 os.lstat() 搭配 stat.FILE_ATTRIBUTE_REPARSE_POINT 
@@ -262,6 +264,7 @@ def is_junction_or_link(path):
 
     return link_type
 
+@lru_cache(maxsize=None)
 def get_link_type(filepath, root_directory):
     """(Lazy) Detect link type for a specific file"""
     try:
