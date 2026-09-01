@@ -12,6 +12,7 @@ Civitai Model Scanner CLI
 """
 
 import os
+import re
 import stat
 import sys
 import json
@@ -23,10 +24,11 @@ from datetime import datetime
 from functools import lru_cache
 
 # 配置
-CIVITAI_API_URL = "https://civitai.com/api/v1/model-versions/by-hash/"
+CIVITAI_API_BASE = "https://civitai.red"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 EXTS = {".bin", ".pt", ".safetensors", ".ckpt", ".gguf", ".zip"}
 INFO_SUFFIX = ".civitai.info"
+PREVIEW_SUFFIX = ".preview.png"
 SHORT_NAME = "sd_civitai_helper"
 VERSION = "1.8.13"  # 保持與主專案一致或自定義
 DELAY = 0.5  # API 請求間隔 (秒)
@@ -68,10 +70,20 @@ def print_log(msg, color=None):
     timestamp = datetime.now().strftime("%H:%M:%S")
     timestamp_str = f"{Colors.GRAY}[{timestamp}]{Colors.RESET}"
     
-    if color:
-        print(f"{timestamp_str} {color}{msg}{Colors.RESET}")
-    else:
-        print(f"{timestamp_str} {msg}")
+    try:
+        if color:
+            print(f"{timestamp_str} {color}{msg}{Colors.RESET}")
+        else:
+            print(f"{timestamp_str} {msg}")
+    except UnicodeEncodeError:
+        # Fallback: encode to console's codepage, replacing unsupported chars
+        import sys
+        enc = sys.stdout.encoding or 'utf-8'
+        safe_msg = msg.encode(enc, errors='replace').decode(enc, errors='replace')
+        if color:
+            print(f"{timestamp_str} {color}{safe_msg}{Colors.RESET}")
+        else:
+            print(f"{timestamp_str} {safe_msg}")
 
 def calculate_sha256(filepath):
     """計算文件的 SHA256 哈希值"""
@@ -90,7 +102,7 @@ def calculate_sha256(filepath):
 
 def get_model_info_from_civitai(model_hash):
     """從 Civitai API 獲取模型資訊"""
-    url = f"{CIVITAI_API_URL}{model_hash}"
+    url = f"{CIVITAI_API_BASE}/api/v1/model-versions/by-hash/{model_hash}"
     headers = {"User-Agent": USER_AGENT}
     
     try:
@@ -156,6 +168,74 @@ def process_model_info(info, is_skeleton=False):
     }
     return info
 
+def download_cover_image(filepath, info, max_size=True):
+    """下載模型的封面預覽圖
+    返回: 0=無圖片, 1=已存在, 2=新下載
+    """
+    # 檢查是否已有預覽圖
+    base, _ = os.path.splitext(filepath)
+    preview_path = f"{base}{PREVIEW_SUFFIX}"
+    
+    if os.path.exists(preview_path):
+        return 1
+    
+    # 從 API 回應中獲取圖片列表
+    images = info.get("images", [])
+    if not images:
+        return 0
+    
+    # 選擇第一張圖片
+    img = images[0]
+    img_url = img.get("url", "")
+    if not img_url:
+        return 0
+    
+    # 如果需要最大尺寸，替換 URL 中的寬度參數
+    if max_size:
+        width = img.get("width", 0)
+        if width:
+            img_url = re.sub(r'/width=\d+/', f'/width={width}/', img_url)
+    
+    # 下載圖片
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        response = requests.get(img_url, headers=headers, timeout=30, stream=True)
+        if response.status_code == 200:
+            with open(preview_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            return 2
+    except Exception as e:
+        print_log(f"Cover download error: {e}", Colors.YELLOW)
+    
+    return 0
+
+def try_download_cover(filepath, info_path, stats_obj, progress_prefix, max_size_preview, info=None):
+    """嘗試下載封面圖 (統一邏輯)
+    返回: True 如果成功下載了新封面
+    """
+    # 如果沒有提供 info，從 info 檔案讀取
+    if info is None:
+        if os.path.exists(info_path):
+            try:
+                with open(info_path, 'r', encoding='utf-8') as f:
+                    info = json.load(f)
+            except Exception:
+                pass
+    
+    if not info or not info.get("images"):
+        return False
+    
+    result = download_cover_image(filepath, info, max_size_preview)
+    if result == 2:
+        stats_obj["covers"] += 1
+        model_name = info.get('model', {}).get('name', 'Unknown')
+        print_log(f"{progress_prefix} Cover downloaded: {Colors.GREEN}{model_name}", Colors.RESET)
+        return True
+    
+    return False
+
 def save_info_file(filepath, info):
     """保存 .civitai.info 文件"""
     base, _ = os.path.splitext(filepath)
@@ -213,6 +293,11 @@ def print_summary(title, stats, scan_root=None):
     # Updated (Green if > 0)
     updated_color = Colors.GREEN if stats['updated'] > 0 else ""
     print(f"Updated:       {updated_color}{stats['updated']}{Colors.RESET}")
+    
+    # Covers downloaded (Cyan if > 0)
+    covers_count = stats.get('covers', 0)
+    covers_color = Colors.CYAN if covers_count > 0 else ""
+    print(f"Covers:        {covers_color}{covers_count}{Colors.RESET}")
     
     # Duplicates (Blue if > 0)
     dup_count = len(stats['duplicates'])
@@ -327,13 +412,15 @@ def get_link_type(filepath, root_directory):
 
     return ""
 
-def scan_directory(directory, refetch_old=False, refetch_only_not_found=False):
+def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, download_cover=True, max_size_preview=True):
     """文件掃描主函數 (支援子目錄總結)"""
     print_log(f"Starting scan in: {directory}", Colors.BLUE)
+    if download_cover:
+        print_log("Cover download: ENABLED", Colors.CYAN)
     
     global_stats = {
         "processed": 0, "ignored": 0, "updated": 0, 
-        "not_found": 0, "failed": 0, "duplicates": []
+        "not_found": 0, "failed": 0, "duplicates": [], "covers": 0
     }
     
     # 使用 mutable list 來讓內嵌函式修改計數
@@ -420,17 +507,15 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False):
             }
 
         # Check if metadata update is needed
-        # 注意: 即使我們剛從 info 讀了 hash，這裡如果是 True (例如 user delete .json but keep .info?)
-        # 其實 metadata_needed checks checks .info existence.
-        # 如果是 not refetch_old, and info exists -> need_update is False.
-        # 但如果 info 讀不到 hash (corrupted?), we calculated new hash.
-        # Still, logic should be consistent.
         need_update = metadata_needed(filepath, refetch_old, refetch_only_not_found)
 
         if not need_update:
             if not is_duplicate:
                 stats_obj["ignored"] += 1
-            # If it IS a duplicate, we already counted it in duplicates list.
+            
+            # 即使不需要更新元數據，仍可下載封面圖
+            if download_cover and not is_duplicate:
+                try_download_cover(filepath, info_path, stats_obj, progress_prefix, max_size_preview)
             return
 
         # --- If execution reaches here, we DO need to write/update metadata ---
@@ -471,6 +556,10 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False):
                 stats_obj["not_found"] += 1
             else:
                 stats_obj["updated"] += 1
+            
+            # 下載封面圖
+            if download_cover and not is_skeleton:
+                try_download_cover(filepath, info_path, stats_obj, progress_prefix, max_size_preview, info)
         else:
             stats_obj["failed"] += 1
 
@@ -500,7 +589,7 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False):
         
         subdir_stats = {
             "processed": 0, "ignored": 0, "updated": 0, 
-            "not_found": 0, "failed": 0, "duplicates": []
+            "not_found": 0, "failed": 0, "duplicates": [], "covers": 0
         }
         
         # 對該子目錄進行遞歸掃描 (啟用 followlinks 以進入 junction)
@@ -526,13 +615,22 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False):
     print_summary(f"Final Count ({directory})", global_stats, directory)
 
 def main():
-    parser = argparse.ArgumentParser(description="Civitai Model Scanner CLI")
-    parser.add_argument("path", help="要掃描的目錄路徑")
-    parser.add_argument("--refetch", action="store_true", help="強制重新獲取已此存在的元數據")
+    global CIVITAI_API_BASE
     
-    parser.add_argument("--refetch-only-not-found", action="store_true", help="只對之前未找到 (Not Found/Skeleton) 的模型重新獲取元數據")
+    parser = argparse.ArgumentParser(description="Civitai Model Scanner CLI")
+    parser.add_argument("path", help="Directory path to scan")
+    parser.add_argument("--refetch", action="store_true", help="Force re-fetch existing metadata")
+    
+    parser.add_argument("--refetch-only-not-found", action="store_true", help="Only re-fetch metadata for models that were not found previously")
+    
+    parser.add_argument("--no-cover", action="store_true", help="Skip downloading model cover preview images")
+    
+    parser.add_argument("--api-base", default=CIVITAI_API_BASE, help=f"Civitai API base URL (default: {CIVITAI_API_BASE})")
 
     args = parser.parse_args()
+    
+    # 更新 API Base URL
+    CIVITAI_API_BASE = args.api_base.rstrip('/')
     
     target_path = os.path.abspath(args.path)
     if not os.path.exists(target_path):
@@ -540,7 +638,7 @@ def main():
         sys.exit(1)
         
     try:
-        scan_directory(target_path, refetch_old=args.refetch, refetch_only_not_found=args.refetch_only_not_found)
+        scan_directory(target_path, refetch_old=args.refetch, refetch_only_not_found=args.refetch_only_not_found, download_cover=not args.no_cover)
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.")
         sys.exit(0)

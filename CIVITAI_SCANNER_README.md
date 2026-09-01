@@ -1,4 +1,7 @@
-# Civitai Model Scanner CLI (`civitai_scanner.py`)
+# Civitai Model Tools (Scanner & Reporter)
+
+## 1. Civitai Model Scanner CLI (`civitai_scanner.py`)
+
 
 ## 📖 簡介 (Introduction)
 
@@ -117,3 +120,40 @@ flowchart TD
 2.  **`process_file(filepath)`**: 核心邏輯。計算 Hash，查詢 API，寫入 Metadata。
 3.  **`print_summary(stats)`**: 報告生成器。**關鍵優化點**：連結類型檢測 (`get_link_type`) 被推遲到這裡執行，避免了在掃描每一千個檔案時浪費 I/O 資源。
 4.  **`is_junction_or_link(path)`**: Windows 專用的底層檢測函式，使用 `os.lstat` 和 `FILE_ATTRIBUTE_REPARSE_POINT` 來精準區分 Junction 和 Symlink。
+
+---
+
+## 2. Civitai Model Report Generator (`civitai_report.py`)
+
+### 📖 簡介 (Introduction)
+
+`civitai_report.py` 是一個用於將 `civitai_scanner.py` 產生的 `.civitai.info` 文件整合為一份視覺化 Markdown 報告的工具。它可以幫助你快速概覽所擁有的模型、其觸發詞 (Trigger Words) 以及對應的 Civitai 連結。
+
+### ✨ 核心功能 (Key Features)
+
+*   **自動分組**: 根據模型類型 (Checkpoint, LORA, VAE 等) 自動進行分類。
+*   **元數據呈現**: 顯示模型版本、基礎模型 (Base Model)、標籤 (Tags) 與觸發詞。
+*   **導覽連結**: 自動生成指向 Civitai 模型頁面的連結。
+*   **狀態標記**: 明確標出僅存在於本地、未在 Civitai 上找到的項目 (Not Found / Skeleton)。
+
+### 🚀 使用方法 (Usage)
+
+```bash
+python civitai_report.py <目標目錄路徑> [options]
+```
+
+#### 參數說明
+
+*   `<path>`: **(必填)** 包含 `.civitai.info` 文件的模型根目錄。
+*   `-o`, `--output`: **(選填)** 報告輸出的文件名，預設為 `CIVITAI_MODELS_REPORT.md`。
+
+### 範例
+
+```bash
+# 在目前的目錄生成報告
+python civitai_report.py "D:\StableDiffusion\models"
+
+# 指定輸出文件名
+python civitai_report.py "D:\StableDiffusion\models" -o "MY_MODELS.md"
+```
+
