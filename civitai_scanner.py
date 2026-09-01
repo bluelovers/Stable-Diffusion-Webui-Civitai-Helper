@@ -21,6 +21,7 @@ import hashlib
 import argparse
 import requests
 from datetime import datetime
+from enum import Enum
 from functools import lru_cache
 
 # 配置
@@ -33,12 +34,19 @@ SHORT_NAME = "sd_civitai_helper"
 VERSION = "1.8.13"  # 保持與主專案一致或自定義
 DELAY = 0.5  # API 請求間隔 (秒)
 
+class EnumCoverStatus(Enum):
+    """封面圖下載狀態"""
+    NO_IMAGE = 0      # 無圖片可用
+    EXISTS = 1        # 預覽圖已存在
+    DOWNLOADED = 2    # 新下載完成
+    FAILED = 3        # 下載失敗
+
 # Windows VT Mode support
 def enable_colors():
     """Detect if we can use colors (ANSI) and enable them on Windows if needed."""
     if not sys.stdout.isatty():
         return False
-        
+
     if os.name == 'nt':
         try:
             from ctypes import windll, byref, c_ulong, create_string_buffer
@@ -69,7 +77,7 @@ class Colors:
 def print_log(msg, color=None):
     timestamp = datetime.now().strftime("%H:%M:%S")
     timestamp_str = f"{Colors.GRAY}[{timestamp}]{Colors.RESET}"
-    
+
     try:
         if color:
             print(f"{timestamp_str} {color}{msg}{Colors.RESET}")
@@ -90,7 +98,7 @@ def calculate_sha256(filepath):
     print_log(f"Calculating SHA256 for: {os.path.basename(filepath)}...")
     sha256_hash = hashlib.sha256()
     block_size = 65536  # 64kb
-    
+
     try:
         with open(filepath, "rb") as f:
             for block in iter(lambda: f.read(block_size), b""):
@@ -104,7 +112,7 @@ def get_model_info_from_civitai(model_hash):
     """從 Civitai API 獲取模型資訊"""
     url = f"{CIVITAI_API_BASE}/api/v1/model-versions/by-hash/{model_hash}"
     headers = {"User-Agent": USER_AGENT}
-    
+
     try:
         response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
@@ -125,7 +133,7 @@ def create_skeleton_info(filepath, model_hash):
         size_kb = os.path.getsize(filepath) // 1024
     except:
         size_kb = 0
-        
+
     return {
         "id": "",
         "modelId": "",
@@ -159,7 +167,7 @@ def process_model_info(info, is_skeleton=False):
     # 確保 extensions 字段存在
     if "extensions" not in info:
         info["extensions"] = {}
-    
+
     # 添加 sd_civitai_helper 版本資訊
     info["extensions"][SHORT_NAME] = {
         "version": VERSION,
@@ -170,32 +178,32 @@ def process_model_info(info, is_skeleton=False):
 
 def download_cover_image(filepath, info, max_size=True):
     """下載模型的封面預覽圖
-    返回: 0=無圖片, 1=已存在, 2=新下載
+    返回: CoverStatus 枚舉值
     """
     # 檢查是否已有預覽圖
     base, _ = os.path.splitext(filepath)
     preview_path = f"{base}{PREVIEW_SUFFIX}"
-    
+
     if os.path.exists(preview_path):
-        return 1
-    
+        return EnumCoverStatus.EXISTS
+
     # 從 API 回應中獲取圖片列表
     images = info.get("images", [])
     if not images:
-        return 0
-    
+        return EnumCoverStatus.NO_IMAGE
+
     # 選擇第一張圖片
     img = images[0]
     img_url = img.get("url", "")
     if not img_url:
-        return 0
-    
+        return EnumCoverStatus.NO_IMAGE
+
     # 如果需要最大尺寸，替換 URL 中的寬度參數
     if max_size:
         width = img.get("width", 0)
         if width:
             img_url = re.sub(r'/width=\d+/', f'/width={width}/', img_url)
-    
+
     # 下載圖片
     headers = {"User-Agent": USER_AGENT}
     try:
@@ -205,11 +213,11 @@ def download_cover_image(filepath, info, max_size=True):
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
-            return 2
+            return EnumCoverStatus.DOWNLOADED
     except Exception as e:
         print_log(f"Cover download error: {e}", Colors.YELLOW)
-    
-    return 0
+
+    return EnumCoverStatus.FAILED
 
 def try_download_cover(filepath, info_path, stats_obj, progress_prefix, max_size_preview, info=None):
     """嘗試下載封面圖 (統一邏輯)
@@ -223,24 +231,24 @@ def try_download_cover(filepath, info_path, stats_obj, progress_prefix, max_size
                     info = json.load(f)
             except Exception:
                 pass
-    
+
     if not info or not info.get("images"):
         return False
-    
+
     result = download_cover_image(filepath, info, max_size_preview)
-    if result == 2:
+    if result == EnumCoverStatus.DOWNLOADED:
         stats_obj["covers"] += 1
         model_name = info.get('model', {}).get('name', 'Unknown')
         print_log(f"{progress_prefix} Cover downloaded: {Colors.GREEN}{model_name}", Colors.RESET)
         return True
-    
+
     return False
 
 def save_info_file(filepath, info):
     """保存 .civitai.info 文件"""
     base, _ = os.path.splitext(filepath)
     info_path = f"{base}{INFO_SUFFIX}"
-    
+
     try:
         with open(info_path, 'w', encoding='utf-8') as f:
             json.dump(info, f, indent=4, ensure_ascii=False)
@@ -254,7 +262,7 @@ def metadata_needed(filepath, refetch_old, refetch_only_not_found=False):
     """檢查是否需要掃描"""
     base, _ = os.path.splitext(filepath)
     info_path = f"{base}{INFO_SUFFIX}"
-    
+
     if refetch_old:
         return True
 
@@ -265,11 +273,11 @@ def metadata_needed(filepath, refetch_old, refetch_only_not_found=False):
         try:
             with open(info_path, 'r', encoding='utf-8') as f:
                 info = json.load(f)
-                
+
             # Check for skeleton_file flag
             if info.get("skeleton_file", False):
                 return True
-                
+
             # Also check extension flag (newer format)
             exts = info.get("extensions", {})
             if exts.get(SHORT_NAME, {}).get("skeleton_file", False):
@@ -277,7 +285,7 @@ def metadata_needed(filepath, refetch_old, refetch_only_not_found=False):
         except:
              # If file is corrupted, re-fetch
              return True
-        
+
     # 如果文件存在且不強制更新，則跳過
     # 這裡可以加入版本檢查邏輯，但為了簡化CLI，預設存在即跳過
     return False
@@ -289,26 +297,26 @@ def print_summary(title, stats, scan_root=None):
     print(f"{Colors.BOLD}Summary for: {Colors.CYAN}{title}{Colors.RESET}")
     print(f"Files Scanned: {stats['processed']}")
     print(f"Ignored:       {Colors.GRAY}{stats['ignored']}{Colors.RESET}")
-    
+
     # Updated (Green if > 0)
     updated_color = Colors.GREEN if stats['updated'] > 0 else ""
     print(f"Updated:       {updated_color}{stats['updated']}{Colors.RESET}")
-    
+
     # Covers downloaded (Cyan if > 0)
     covers_count = stats.get('covers', 0)
     covers_color = Colors.CYAN if covers_count > 0 else ""
     print(f"Covers:        {covers_color}{covers_count}{Colors.RESET}")
-    
+
     # Duplicates (Blue if > 0)
     dup_count = len(stats['duplicates'])
     dup_color = Colors.BLUE if dup_count > 0 else ""
     print(f"Duplicates:    {dup_color}{dup_count}{Colors.RESET}")
-    
-    
+
+
     # Not Found (Yellow if > 0)
     nf_color = Colors.YELLOW if stats['not_found'] > 0 else ""
     print(f"Not Found:     {nf_color}{stats['not_found']}{Colors.RESET}")
-    
+
     # Failed (Red if > 0)
     if stats['failed'] > 0:
         print(f"Failed:        {Colors.RED}{stats['failed']}{Colors.RESET}")
@@ -316,7 +324,7 @@ def print_summary(title, stats, scan_root=None):
     # 顯示重複檔案路徑 (分組顯示)
     if dup_count > 0 and scan_root:
         print(f"\n{Colors.GRAY}[Duplicate Files List]{Colors.RESET}")
-        
+
         # Group by hash
         groups = {}
         for item in stats['duplicates']:
@@ -326,7 +334,7 @@ def print_summary(title, stats, scan_root=None):
                 if short_h not in groups:
                     groups[short_h] = []
                 groups[short_h].append(p_abs)
-        
+
         for h, paths in groups.items():
             print(f"  Hash: {Colors.BLUE}{h}...{Colors.RESET}")
             for p_abs in paths:
@@ -336,13 +344,13 @@ def print_summary(title, stats, scan_root=None):
                     print(f"    - {p_rel}{link_info}")
                 except Exception:
                     print(f"    - {p_abs}")
-        
+
     print(border + "\n")
 
 @lru_cache(maxsize=None)
 def is_junction_or_link(path):
     """
-    在 Windows 上用 os.lstat() 搭配 stat.FILE_ATTRIBUTE_REPARSE_POINT 
+    在 Windows 上用 os.lstat() 搭配 stat.FILE_ATTRIBUTE_REPARSE_POINT
     可以先判斷「這個路徑是不是某種 reparse point」。
     接著再用 os.path.islink() 判斷是否為 symlink。
     如果是 reparse point 但不是 symlink，那麼它很可能就是 junction。
@@ -383,25 +391,25 @@ def get_link_type(filepath, root_directory):
     # Junction/Link check in parents
     check_dir = os.path.dirname(filepath)
     root_norm = os.path.normcase(root_directory)
-    
+
     while True:
         # Check if current dir is a link/junction
         # Use helper check
         ptype = is_junction_or_link(check_dir)
         if ptype:
              return f" {Colors.CYAN}({ptype}){Colors.RESET}"
-            
+
         # Stop if we strictly reached the scan root
         if os.path.normcase(check_dir) == root_norm:
             break
-            
+
         # Move up
         parent = os.path.dirname(check_dir)
-        
+
         # Stop if we hit filesystem root (parent is same as check_dir)
         if parent == check_dir:
             break
-            
+
         # Stop if we somehow went 'above' root (should only happen if file wasn't inside root)
         if len(parent) < len(root_directory):
              # Double check if we are really outside root
@@ -417,18 +425,18 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, d
     print_log(f"Starting scan in: {directory}", Colors.BLUE)
     if download_cover:
         print_log("Cover download: ENABLED", Colors.CYAN)
-    
+
     global_stats = {
-        "processed": 0, "ignored": 0, "updated": 0, 
+        "processed": 0, "ignored": 0, "updated": 0,
         "not_found": 0, "failed": 0, "duplicates": [], "covers": 0
     }
-    
+
     # 使用 mutable list 來讓內嵌函式修改計數
     counter = [0]
-    
+
     # 哈希緩存: { hash: { 'data': api_info, 'path': first_filepath } }
     hash_cache = {}
-    
+
     # 記錄已經將 "正本" 加入過 duplicates 清單的 Hash
     recorded_dup_originals = set()
 
@@ -440,16 +448,16 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, d
 
         counter[0] += 1
         stats_obj["processed"] += 1
-        
+
         relative_path = os.path.relpath(filepath, start=directory)
         progress_prefix = f"{Colors.GRAY}[{counter[0]}]{Colors.RESET}"
-        
-        
+
+
         # 0. 嘗試從現有元數據讀取 Hash (優化效能)
         model_hash = None
         base, _ = os.path.splitext(filepath)
         info_path = f"{base}{INFO_SUFFIX}"
-        
+
         if not refetch_old and os.path.exists(info_path):
             try:
                 with open(info_path, 'r', encoding='utf-8') as f:
@@ -467,33 +475,33 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, d
         # 1. 如果沒讀到或者需要重算，則計算 Hash
         if not model_hash:
             model_hash = calculate_sha256(filepath)
-            
+
         if not model_hash:
             print_log(f"{progress_prefix} Failed hash: {relative_path}", Colors.RED)
             stats_obj["failed"] += 1
             return
-            
+
         is_duplicate = False
         info = None
-        
+
         # 2. Check Cache
         if model_hash in hash_cache:
             is_duplicate = True
             cached_entry = hash_cache[model_hash]
             original_path_abs = cached_entry['path']
             original_path = os.path.relpath(original_path_abs, start=directory)
-            
+
             print_log(f"{progress_prefix} Duplicate detected (Same as {original_path})", Colors.GRAY)
-            
+
             # Record duplicate with label
             if model_hash not in recorded_dup_originals:
                 # 將正本加入清單
                 stats_obj["duplicates"].append((original_path_abs, model_hash))
                 recorded_dup_originals.add(model_hash)
-            
+
             # 將當前副本加入清單
             stats_obj["duplicates"].append((filepath, model_hash))
-            
+
             info = cached_entry['data']
             if isinstance(info, dict):
                 info = info.copy()
@@ -512,7 +520,7 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, d
         if not need_update:
             if not is_duplicate:
                 stats_obj["ignored"] += 1
-            
+
             # 即使不需要更新元數據，仍可下載封面圖
             if download_cover and not is_duplicate:
                 try_download_cover(filepath, info_path, stats_obj, progress_prefix, max_size_preview)
@@ -522,32 +530,32 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, d
 
         # If duplicate but missing info (lazy load)
         if is_duplicate and info is None:
-            time.sleep(DELAY) 
+            time.sleep(DELAY)
             info = get_model_info_from_civitai(model_hash)
             hash_cache[model_hash]['data'] = info
-        
+
         # New file needing update
         elif not is_duplicate:
             time.sleep(DELAY)
             info = get_model_info_from_civitai(model_hash)
             hash_cache[model_hash]['data'] = info
-            
+
         print_log(f"{progress_prefix} Processing: {Colors.CYAN}{relative_path}", Colors.RESET)
-        
+
         is_skeleton = False
         if not info:
             if not is_duplicate:
                  print_log(f"Model not found: {relative_path}", Colors.YELLOW)
-            
+
             info = create_skeleton_info(filepath, model_hash)
             is_skeleton = True
         else:
             model_name = info.get('model', {}).get('name', 'Unknown')
-            if not is_duplicate: 
+            if not is_duplicate:
                 print_log(f"Found info: {Colors.GREEN}{model_name}", Colors.RESET)
-        
+
         info = process_model_info(info, is_skeleton)
-        
+
         if save_info_file(filepath, info):
             if is_duplicate:
                 # Already added to list above
@@ -556,7 +564,7 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, d
                 stats_obj["not_found"] += 1
             else:
                 stats_obj["updated"] += 1
-            
+
             # 下載封面圖
             if download_cover and not is_skeleton:
                 try_download_cover(filepath, info_path, stats_obj, progress_prefix, max_size_preview, info)
@@ -570,44 +578,44 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, d
         print_log(f"Error listing directory: {e}", Colors.RED)
         return
 
-    root_files = [os.path.join(directory, f) for f in root_items 
+    root_files = [os.path.join(directory, f) for f in root_items
                   if os.path.isfile(os.path.join(directory, f))]
-    
+
     for f in root_files:
         process_file(f, global_stats)
 
     # 2. 處理第一級子目錄
-    subdirs = [d for d in root_items 
+    subdirs = [d for d in root_items
                if os.path.isdir(os.path.join(directory, d))]
-    
+
     subdirs.sort(key=str.lower)
 
     for subdir in subdirs:
         subdir_path = os.path.join(directory, subdir)
-        
+
         print_log(f"Scanning subdirectory: {subdir}...", Colors.BLUE)
-        
+
         subdir_stats = {
-            "processed": 0, "ignored": 0, "updated": 0, 
+            "processed": 0, "ignored": 0, "updated": 0,
             "not_found": 0, "failed": 0, "duplicates": [], "covers": 0
         }
-        
+
         # 對該子目錄進行遞歸掃描 (啟用 followlinks 以進入 junction)
         for root, _, files in os.walk(subdir_path):
             for file in files:
                 filepath = os.path.join(root, file)
                 process_file(filepath, subdir_stats)
-        
+
         # 將子目錄統計合併到全域 (duplicates extend list)
         for k in global_stats:
             if k == "duplicates":
                 global_stats[k].extend(subdir_stats[k])
             else:
                 global_stats[k] += subdir_stats[k]
-            
+
         # 若有更新檔案(updated, not_found, duplicates)
-        if (subdir_stats["updated"] > 0 or 
-            subdir_stats["not_found"] > 0 or 
+        if (subdir_stats["updated"] > 0 or
+            subdir_stats["not_found"] > 0 or
             len(subdir_stats["duplicates"]) > 0):
             print_summary(subdir, subdir_stats, directory)
 
@@ -616,27 +624,33 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, d
 
 def main():
     global CIVITAI_API_BASE
-    
+
+    # 從環境變數讀取預設值
+    env_api_base = os.environ.get("CIVITAI_HELPER_API_BASE", CIVITAI_API_BASE)
+    env_no_cover = os.environ.get("CIVITAI_HELPER_NO_COVER", "").lower() in ("1", "true", "yes")
+    env_refetch = os.environ.get("CIVITAI_HELPER_REFETCH", "").lower() in ("1", "true", "yes")
+    env_refetch_not_found = os.environ.get("CIVITAI_HELPER_REFETCH_ONLY_NOT_FOUND", "").lower() in ("1", "true", "yes")
+
     parser = argparse.ArgumentParser(description="Civitai Model Scanner CLI")
     parser.add_argument("path", help="Directory path to scan")
-    parser.add_argument("--refetch", action="store_true", help="Force re-fetch existing metadata")
-    
-    parser.add_argument("--refetch-only-not-found", action="store_true", help="Only re-fetch metadata for models that were not found previously")
-    
-    parser.add_argument("--no-cover", action="store_true", help="Skip downloading model cover preview images")
-    
-    parser.add_argument("--api-base", default=CIVITAI_API_BASE, help=f"Civitai API base URL (default: {CIVITAI_API_BASE})")
+    parser.add_argument("--refetch", action="store_true", default=env_refetch, help="Force re-fetch existing metadata")
+
+    parser.add_argument("--refetch-only-not-found", action="store_true", default=env_refetch_not_found, help="Only re-fetch metadata for models that were not found previously")
+
+    parser.add_argument("--no-cover", action="store_true", default=env_no_cover, help="Skip downloading model cover preview images")
+
+    parser.add_argument("--api-base", default=env_api_base, help=f"Civitai API base URL (default: {env_api_base})")
 
     args = parser.parse_args()
-    
+
     # 更新 API Base URL
     CIVITAI_API_BASE = args.api_base.rstrip('/')
-    
+
     target_path = os.path.abspath(args.path)
     if not os.path.exists(target_path):
         print(f"Error: Path does not exist: {target_path}")
         sys.exit(1)
-        
+
     try:
         scan_directory(target_path, refetch_old=args.refetch, refetch_only_not_found=args.refetch_only_not_found, download_cover=not args.no_cover)
     except KeyboardInterrupt:
