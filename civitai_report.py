@@ -67,6 +67,61 @@ def get_model_path(info_path):
             return candidate
     return None
 
+def find_matched_file(info, local_sha):
+    """比對 local hash 與 info["files"] 內各檔案的 hashes.SHA256，
+    找出本地檔案對應的是 Civitai 上哪一個 file (大小寫不敏感)。
+    同一 model version 可能有多個 files (不同精度/大小)，靠此比對才能
+    正確顯示該檔的 metadata.fp / downloadUrl / primary。
+    回傳: (index, file_node) 或 (None, None)
+    """
+    if not info or not local_sha:
+        return None, None
+
+    target = local_sha.upper()
+    for idx, f in enumerate(info.get("files") or []):
+        if not isinstance(f, dict):
+            continue
+        api_sha = (f.get("hashes", {}).get("SHA256") or "").upper()
+        if api_sha and api_sha == target:
+            return idx, f
+
+    return None, None
+
+def format_file_size(size_bytes):
+    """將位元組大小格式化為人類可讀字串 (B/KB/MB/GB/TB)"""
+    if not size_bytes or size_bytes <= 0:
+        return "Unknown"
+
+    size = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.2f} {unit}"
+        size /= 1024
+
+    return f"{size:.2f} TB"
+
+def get_local_size_bytes(info_path, matched_file=None):
+    """取得本地模型檔案大小 (位元組)
+    優先取實際磁碟大小 (最準確)；找不到本地模型檔時，
+    退回 matched file 的 API sizeKB 換算 (僅供顯示)。
+    回傳: int 或 None
+    """
+    model_path = get_model_path(info_path)
+    if model_path:
+        try:
+            return os.path.getsize(model_path)
+        except OSError:
+            pass
+
+    if matched_file:
+        size_kb = matched_file.get("sizeKB")
+        if size_kb:
+            return int(size_kb * 1024)
+
+    return None
+
 def compute_sha256(file_path):
     """與 civitai_scanner.py calculate_sha256 相同的算法 (SHA256、65536 bytes 分塊、大寫 hex)"""
     sha256_hash = hashlib.sha256()
@@ -209,6 +264,18 @@ def generate_report(directory, output_file):
                     # 封面圖 / 封面影片 (連結路徑相對於報告根目錄)
                     cover_image, cover_video = get_preview_paths(file_path, directory)
 
+                    local_sha = get_sha256(file_path, show_progress=True)
+
+                    # 偵測 local hash 符合 files[] 內哪一個檔案 (比對 hashes.SHA256)
+                    matched_idx, matched_file = find_matched_file(info, local_sha)
+
+                    # 該檔案的 metadata (優先 matched file，欄位缺失時安全回退)
+                    matched_meta = (matched_file or {}).get("metadata") or {}
+                    matched_fp = matched_meta.get("fp")
+                    matched_primary = (matched_file or {}).get("primary")
+                    # downloadUrl: 優先 matched file 的專屬下載連結 (含 fileId)，退回頂層 downloadUrl
+                    matched_download_url = ((matched_file or {}).get("downloadUrl") or info.get("downloadUrl"))
+
                     # 組合顯示需要的數據
                     model_data = {
                         "name": m_name,
@@ -224,7 +291,12 @@ def generate_report(directory, output_file):
                         "file_abs_path": file_path,
                         "cover_image": cover_image,
                         "cover_video": cover_video,
-                        "sha256": get_sha256(file_path, show_progress=True)
+                        "sha256": local_sha,
+                        "matched_file_name": (matched_file or {}).get("name"),
+                        "fp": matched_fp,
+                        "primary": matched_primary,
+                        "download_url": matched_download_url,
+                        "size_bytes": get_local_size_bytes(file_path, matched_file)
                     }
 
                     models_by_type[m_type].append(model_data)
@@ -268,6 +340,25 @@ def generate_report(directory, output_file):
 
                 md.write(f"- **Base Model:** {m['baseModel']}\n")
 
+                # local hash 比對 files[] 後對應的檔案與其 metadata
+                if m['matched_file_name']:
+                    md.write(f"- **Matched File:** `{m['matched_file_name']}`\n")
+
+                if m['fp']:
+                    md.write(f"- **Precision (metadata.fp):** `{m['fp']}`\n")
+
+                if m['download_url']:
+                    md.write(f"- **Download URL:** {m['download_url']}\n")
+
+                if m['primary'] is not None:
+                    md.write(f"- **Primary:** {'Yes' if m['primary'] else 'No'}\n")
+
+                if m['sha256']:
+                    md.write(f"- **Local Hash (SHA256):** `{m['sha256']}`\n")
+
+                if m['size_bytes']:
+                    md.write(f"- **File Size:** {format_file_size(m['size_bytes'])}\n")
+
                 if m['trainedWords']:
                     md.write(f"- **Trigger Words:** {format_trigger_words(m['trainedWords'])}\n")
 
@@ -275,7 +366,7 @@ def generate_report(directory, output_file):
                     md.write(f"- **Tags:** {format_tags(m['tags'])}\n")
 
                 if not m['is_skeleton'] and m['modelId']:
-                    civitai_link = f"https://civitai.com/models/{m['modelId']}"
+                    civitai_link = f"https://civitai.red/models/{m['modelId']}"
                     if m['versionId']:
                         civitai_link += f"?modelVersionId={m['versionId']}"
                     md.write(f"- **Link:** [View on Civitai]({civitai_link})\n")
