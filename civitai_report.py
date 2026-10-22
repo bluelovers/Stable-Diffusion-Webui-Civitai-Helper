@@ -65,24 +65,95 @@ def get_model_path(info_path):
             return candidate
     return None
 
-def compute_sha256(file_path, chunk_size=1024 * 1024):
-    """讀檔重算 SHA256 (1MB 分塊)，回傳大寫 hex，失敗回傳 None"""
+def compute_sha256(file_path):
+    """與 civitai_scanner.py calculate_sha256 相同的算法 (SHA256、65536 bytes 分塊、大寫 hex)"""
+    sha256_hash = hashlib.sha256()
+    block_size = 65536  # 64kb
+
     try:
-        h = hashlib.sha256()
         with open(file_path, "rb") as f:
-            for block in iter(lambda: f.read(chunk_size), b""):
-                h.update(block)
-        return h.hexdigest().upper()
-    except OSError:
+            for block in iter(lambda: f.read(block_size), b""):
+                sha256_hash.update(block)
+        return sha256_hash.hexdigest().upper()
+    except Exception as e:
+        print(f"Error calculating hash: {e}")
         return None
 
+def write_local_sha256(info_path, info, sha):
+    """將重算的本地 hash 回填到 info 的 extensions.sd_civitai_helper.local_sha256。
+    僅在讀取不到快取、由 report 重算成功時呼叫 (report 端的快取回填)。
+    只新增此欄位，不動 files[].hashes；骨架 info 不寫入。
+    寫入失敗僅提示，不影響報告產出。
+    """
+    SHORT_NAME = "sd_civitai_helper"
+
+    extensions = None
+    is_skeleton = False
+    if info is None:
+        is_skeleton = True
+        extensions = {
+            SHORT_NAME: {
+                "skeleton_file": True
+            }
+        }
+        info = {
+            "extensions": extensions
+        }
+    else:
+        is_skeleton = info.get("skeleton_file", None)
+        extensions = info.get("extensions", None)
+        if extensions is None or extensions.get(SHORT_NAME, None) is None:
+            extensions = {} if extensions is None else extensions
+            extensions[SHORT_NAME] = {
+                "skeleton_file": is_skeleton
+            }
+
+        if is_skeleton is None:
+            is_skeleton = extensions.get(SHORT_NAME, {}).get("skeleton_file", False)
+
+    # info["skeleton_file"] = is_skeleton
+
+    extensions[SHORT_NAME]["skeleton_file"] = is_skeleton
+
+    try:
+        extensions["local_sha256"] = sha
+        info["extensions"] = extensions
+
+        with open(info_path, "w", encoding="utf-8") as f:
+            json.dump(info, f, indent=4, ensure_ascii=False)
+        return True
+    except Exception as e:
+        print(f"Warning: failed to write local_sha256 for {os.path.basename(info_path)}: {e}")
+        return False
+
 def get_sha256(info_path, show_progress=False):
-    """取得本地模型檔的 SHA256
-    直接重算本地模型檔內容最準確 —— 檔名不保證等於 info 內 files[].name，
-    且同一版本可能有多個 files (不同量化)。info 僅作為找不到模型檔時的最後 fallback。
-    show_progress=True 時印出正在計算的檔名 (大檔重算耗時，避免看似卡住)。
+    """取得本地模型檔的 SHA256 (用於重複檔案比對)
+    1) 優先讀取快取欄位 extensions.sd_civitai_helper.local_sha256
+       (scanner 寫入 info 時一併寫入，或 report 重算後回填)；
+       讀取得到就直接採用，免重讀大檔 —— report 無法自行得知確實的 hash，
+       此快取正是讓 report 免重算的機制。
+    2) 讀取不到 (舊版 info / 欄位缺失) 則重算本地模型檔，成功後寫回 info
+       回填快取，下次直接讀取 —— 以內容為準，檔名不保證等於 info 內
+       files[].name，同一版本也可能有多個 files。
+    3) 找不到本地模型檔時，退回 info 內單一檔案的 API hash (不寫回)。
+    show_progress=True 時，重算前印出檔名與大小 (大檔耗時，避免看似卡住)。
     回傳大寫 hex，無法取得時回傳 None
     """
+    # 讀 info: 供 1) 快取、2) 回填與 3) fallback 共用
+    info = None
+    try:
+        with open(info_path, "r", encoding="utf-8") as f:
+            info = json.load(f)
+    except Exception:
+        pass
+
+    # 1) 快取值 (scanner 寫入或 report 回填) —— 讀取得到就免重算
+    if info:
+        sha = info.get("extensions", {}).get("local_sha256")
+        if sha:
+            return sha.upper()
+
+    # 2) 讀取不到 → 重算本地模型檔，成功後寫回 info 供下次直接讀取
     model_path = get_model_path(info_path)
     if model_path:
         if show_progress:
@@ -90,26 +161,23 @@ def get_sha256(info_path, show_progress=False):
             print(f"  Hashing ({size_mb:,.0f} MB): {os.path.basename(model_path)}...")
         sha = compute_sha256(model_path)
         if sha:
+            write_local_sha256(info_path, info, sha)
             return sha
 
-    # Fallback: 找不到本地模型檔時，退回 info 內單一檔案的 hash
-    try:
-        with open(info_path, "r", encoding="utf-8") as f:
-            info = json.load(f)
+    # 3) Fallback: 找不到本地模型檔時，退回 info 內單一檔案的 hash (不寫回)
+    if info:
         files = info.get("files", [])
         if len(files) == 1:
             return (files[0].get("hashes", {}).get("SHA256") or "").upper() or None
-    except Exception:
-        pass
     return None
 
 def generate_report(directory, output_file):
     print(f"Scanning for {INFO_SUFFIX} files in: {directory}...")
-    
+
     models_by_type = {}
     total_count = 0
     skeleton_count = 0
-    
+
     for root, _, files in os.walk(directory):
         for file in files:
             if file.endswith(INFO_SUFFIX):
@@ -117,28 +185,28 @@ def generate_report(directory, output_file):
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         info = json.load(f)
-                    
+
                     # 獲取模型資訊
                     m_model = info.get("model", {})
                     m_type = m_model.get("type", "Unknown")
                     m_name = m_model.get("name") or info.get("name") or "Unnamed Model"
                     v_name = info.get("name", "Unknown Version")
-                    
+
                     is_skeleton = info.get("skeleton_file", False)
                     if not is_skeleton:
                         exts = info.get("extensions", {})
                         if exts.get("sd_civitai_helper", {}).get("skeleton_file", False):
                             is_skeleton = True
-                    
+
                     if is_skeleton:
                         skeleton_count += 1
-                    
+
                     if m_type not in models_by_type:
                         models_by_type[m_type] = []
-                    
+
                     # 封面圖 / 封面影片 (連結路徑相對於報告根目錄)
                     cover_image, cover_video = get_preview_paths(file_path, directory)
-                    
+
                     # 組合顯示需要的數據
                     model_data = {
                         "name": m_name,
@@ -155,10 +223,10 @@ def generate_report(directory, output_file):
                         "cover_video": cover_video,
                         "sha256": get_sha256(file_path, show_progress=True)
                     }
-                    
+
                     models_by_type[m_type].append(model_data)
                     total_count += 1
-                    
+
                 except Exception as e:
                     print(f"Error reading {file_path}: {e}")
 
@@ -174,13 +242,13 @@ def generate_report(directory, output_file):
     with open(output_file, 'w', encoding='utf-8') as md:
         md.write(f"# Civitai Models Report\n\n")
         md.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        
+
         # 總結
         md.write(f"## Summary\n\n")
         md.write(f"- **Total Models Detected:** {total_count}\n")
         md.write(f"- **Linked to Civitai:** {total_count - skeleton_count}\n")
         md.write(f"- **Local Only (Not Found):** {skeleton_count}\n\n")
-        
+
         md.write("| Type | Count |\n")
         md.write("| :--- | :---- |\n")
         for m_type in sorted(models_by_type.keys()):
@@ -190,25 +258,25 @@ def generate_report(directory, output_file):
         # 詳細列表
         for m_type in sorted(models_by_type.keys()):
             md.write(f"## {m_type}\n\n")
-            
+
             for m in models_by_type[m_type]:
                 status_tag = " ⚠️ (Not on Civitai)" if m["is_skeleton"] else ""
                 md.write(f"### {m['name']} - {m['version']}{status_tag}\n\n")
-                
+
                 md.write(f"- **Base Model:** {m['baseModel']}\n")
-                
+
                 if m['trainedWords']:
                     md.write(f"- **Trigger Words:** {format_trigger_words(m['trainedWords'])}\n")
-                
+
                 if m['tags']:
                     md.write(f"- **Tags:** {format_tags(m['tags'])}\n")
-                
+
                 if not m['is_skeleton'] and m['modelId']:
                     civitai_link = f"https://civitai.com/models/{m['modelId']}"
                     if m['versionId']:
                         civitai_link += f"?modelVersionId={m['versionId']}"
                     md.write(f"- **Link:** [View on Civitai]({civitai_link})\n")
-                
+
                 md.write(f"- **Local Path:** `{m['file_rel_path']}`\n")
 
                 if m['cover_image']:
@@ -218,7 +286,7 @@ def generate_report(directory, output_file):
                     md.write(f"- **Cover Video:** [{os.path.basename(m['cover_video'])}]({m['cover_video']})\n")
 
                 md.write("\n")
-            
+
             md.write("---\n\n")
 
         # 重複檔案報告 (依 SHA256 比對)
@@ -270,16 +338,16 @@ def main():
     parser = argparse.ArgumentParser(description="Generate a Markdown report from .civitai.info files.")
     parser.add_argument("path", help="Directory to scan")
     parser.add_argument("-o", "--output", help="Output Markdown file name", default=DEFAULT_REPORT_NAME)
-    
+
     args = parser.parse_args()
-    
+
     target_path = os.path.abspath(args.path)
     if not os.path.exists(target_path):
         print(f"Error: Path does not exist: {target_path}")
         return
-        
+
     output_path = os.path.join(target_path, args.output)
-    
+
     generate_report(target_path, output_path)
 
 if __name__ == "__main__":

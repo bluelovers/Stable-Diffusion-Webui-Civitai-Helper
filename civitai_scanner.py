@@ -143,7 +143,7 @@ def print_log(msg, color=None):
             print(f"{timestamp_str} {safe_msg}")
 
 def calculate_sha256(filepath):
-    """計算文件的 SHA256 哈希值"""
+    """計算文件的 SHA256 哈希值 (與 civitai_report.py 的 compute_sha256 同演算法)"""
     print_log(f"Calculating SHA256 for: {os.path.basename(filepath)}...")
     sha256_hash = hashlib.sha256()
     block_size = 65536  # 64kb
@@ -211,8 +211,10 @@ def create_skeleton_info(filepath, model_hash):
         "skeleton_file": True
     }
 
-def process_model_info(info, is_skeleton=False):
+def process_model_info(info, is_skeleton=False, model_hash=None):
     """處理模型資訊，添加插件擴展字段"""
+    info["skeleton_file"] = None
+
     # 確保 extensions 字段存在
     if "extensions" not in info:
         info["extensions"] = {}
@@ -223,6 +225,10 @@ def process_model_info(info, is_skeleton=False):
         "last_update": int(time.time()),
         "skeleton_file": is_skeleton
     }
+
+    if model_hash:
+        info["extensions"]["local_sha256"] = model_hash
+
     return info
 
 def get_attachment_kind(item):
@@ -538,6 +544,25 @@ def get_link_type(filepath, root_directory):
 
     return ""
 
+def get_info_model_hash(info_path):
+    """從 info 檔案讀取 local_sha256 快取值"""
+    with open(info_path, 'r', encoding='utf-8') as f:
+        local_info = json.load(f)
+        extensions = local_info.get("extensions", {})
+        if extensions:
+            local_sha256 = extensions.get("local_sha256")
+            if local_sha256:
+                return local_sha256
+        files_list = local_info.get("files", [])
+        if files_list:
+            for file_node in files_list:
+                hashes = file_node.get("hashes", {})
+                if "SHA256" in hashes:
+                    return hashes["SHA256"]
+
+    return None
+
+
 def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, download_cover=True, max_size_preview=True, download_video=False, attachments_only=False, force_attachments=False):
     """文件掃描主函數 (支援子目錄總結)
     attachments_only=True 時，僅依現有 .civitai.info 重新下載封面/影片附件，
@@ -609,15 +634,7 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, d
 
         if not refetch_old and os.path.exists(info_path):
             try:
-                with open(info_path, 'r', encoding='utf-8') as f:
-                    local_info = json.load(f)
-                    files_list = local_info.get("files", [])
-                    if files_list:
-                        for file_node in files_list:
-                            hashes = file_node.get("hashes", {})
-                            if "SHA256" in hashes:
-                                model_hash = hashes["SHA256"]
-                                break
+                model_hash = get_info_model_hash(info_path)
             except Exception:
                 pass
 
@@ -714,7 +731,7 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, d
             if not is_duplicate:
                 print_log(f"Found info: {Colors.GREEN}{model_name}", Colors.RESET)
 
-        info = process_model_info(info, is_skeleton)
+        info = process_model_info(info, is_skeleton, model_hash)
 
         if save_info_file(filepath, info):
             if is_duplicate:
