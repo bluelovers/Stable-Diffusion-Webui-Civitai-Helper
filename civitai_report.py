@@ -8,9 +8,11 @@ Civitai Model Report Generator
 
 import os
 import json
+import stat
 import hashlib
 import argparse
 from datetime import datetime
+from functools import lru_cache
 
 # 配置
 INFO_SUFFIX = ".civitai.info"
@@ -219,6 +221,7 @@ def generate_report(directory, output_file):
                         "versionId": info.get("id"),
                         "is_skeleton": is_skeleton,
                         "file_rel_path": os.path.relpath(file_path, directory),
+                        "file_abs_path": file_path,
                         "cover_image": cover_image,
                         "cover_video": cover_video,
                         "sha256": get_sha256(file_path, show_progress=True)
@@ -290,12 +293,94 @@ def generate_report(directory, output_file):
             md.write("---\n\n")
 
         # 重複檔案報告 (依 SHA256 比對)
-        write_duplicate_report(md, models_by_type)
+        write_duplicate_report(md, models_by_type, directory)
 
     print(f"Report generated successfully: {output_file}")
 
-def write_duplicate_report(md, models_by_type):
-    """依 SHA256 群組，列出內容重複的模型檔案"""
+@lru_cache(maxsize=None)
+def is_junction_or_link(path):
+    """偵測路徑本身的連結型別 (移植自 civitai_scanner.py，同一套判斷)
+    Windows 上用 os.lstat() 搭配 stat.FILE_ATTRIBUTE_REPARSE_POINT
+    先判斷是否為 reparse point，再用 os.path.islink() 區分 symlink；
+    是 reparse point 但不是 symlink，那麼很可能就是 junction。
+    檔案 (非目錄) 則以 st.st_nlink > 1 判斷 hardlink。
+    回傳: "Symlink" / "Junction" / "Hardlink" / "" (一般路徑) / None (偵測失敗)
+    """
+    link_type = ""
+    try:
+        if os.path.islink(path):
+            link_type = "Symlink"
+        else:
+            is_dir = os.path.isdir(path)
+
+            st = os.lstat(path)
+            # st_file_attributes 僅 Windows 存在，其他平台視為 0 (非 reparse point)
+            if is_dir and getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                link_type = "Junction"
+            elif not is_dir and st.st_nlink > 1:
+                link_type = "Hardlink"
+    except:
+        if link_type:
+            return link_type
+        return None
+
+    return link_type
+
+@lru_cache(maxsize=None)
+def get_link_type(filepath, root_directory):
+    """(Lazy) 回傳檔案路徑鏈上的連結型別標註 (含父目錄 junction 檢查)
+    與 civitai_scanner.py get_link_type 相同邏輯 (lru_cache 緩存、
+    由檔案本身往上逐層檢查父目錄直到 root)；差別僅在回傳 Markdown
+    用的純文字而非終端機顏色字串。
+    回傳: " (Symlink)" / " (Junction)" / " (Hardlink)" / ""
+    """
+    try:
+        filepath = os.path.abspath(filepath)
+        root_directory = os.path.abspath(root_directory)
+    except:
+        return ""
+
+    # Check file itself
+    link_type = is_junction_or_link(filepath)
+    if link_type == "Symlink" or link_type == "Hardlink":
+        return f" ({link_type})"
+
+    # Junction/Link check in parents
+    check_dir = os.path.dirname(filepath)
+    root_norm = os.path.normcase(root_directory)
+
+    while True:
+        # Check if current dir is a link/junction
+        ptype = is_junction_or_link(check_dir)
+        if ptype:
+            return f" ({ptype})"
+
+        # Stop if we strictly reached the scan root
+        if os.path.normcase(check_dir) == root_norm:
+            break
+
+        # Move up
+        parent = os.path.dirname(check_dir)
+
+        # Stop if we hit filesystem root (parent is same as check_dir)
+        if parent == check_dir:
+            break
+
+        # Stop if we somehow went 'above' root (should only happen if file wasn't inside root)
+        if len(parent) < len(root_directory):
+            # Double check if we are really outside root
+            if not os.path.normcase(check_dir).startswith(root_norm):
+                break
+
+        check_dir = parent
+
+    return ""
+
+def write_duplicate_report(md, models_by_type, report_root):
+    """依 SHA256 群組，列出內容重複的模型檔案
+    每個項目附連結型別 (Symlink/Junction/Hardlink，偵測邏輯同 civitai_scanner.py)，
+    讀者可分辨「真正多佔空間的實體副本」與「經連結指向同一實體檔的項目」。
+    """
     # 攤平所有模型並以 sha256 群組
     all_models = []
     for m_type in models_by_type:
@@ -317,20 +402,43 @@ def write_duplicate_report(md, models_by_type):
         md.write("No duplicate model files detected.\n\n")
         return
 
+    # 先為所有項目偵測連結型別 (lazy + lru_cache，同 scanner 的時機: 只在報告階段才做 I/O)
+    # 並把「一般檔案」排在前、連結項目排在後 —— 群組第一列即為正本/實體副本
+    for group in dup_groups.values():
+        for m in group:
+            m["link_type"] = get_link_type(m["file_abs_path"], report_root).strip()
+        group.sort(key=lambda x: x["link_type"] != "")
+
     dup_file_count = sum(len(group) for group in dup_groups.values())
+    link_file_count = sum(1 for group in dup_groups.values() for m in group if m["link_type"])
+
     md.write(f"- **Duplicate Groups:** {len(dup_groups)}\n")
-    md.write(f"- **Files Involved:** {dup_file_count}\n\n")
+    md.write(f"- **Files Involved:** {dup_file_count}\n")
+    if link_file_count:
+        md.write(f"- **Entries via Links:** {link_file_count} (Symlink/Junction/Hardlink)\n")
+    md.write("\n")
 
     for i, (sha, group) in enumerate(sorted(dup_groups.items(), key=lambda x: x[1][0]["name"].lower()), start=1):
+        link_count = sum(1 for m in group if m["link_type"])
         first = group[0]
         md.write(f"### Group {i}: {first['name']} - {first['version']}\n\n")
         md.write(f"- **SHA256:** `{sha}`\n")
-        md.write(f"- **Copies:** {len(group)}\n\n")
-        md.write("| # | Type | Version | Local Path |\n")
-        md.write("| :--- | :--- | :--- | :--- |\n")
+        copies_line = f"- **Copies:** {len(group)}"
+        if link_count:
+            copies_line += f" ({link_count} via link)"
+        md.write(copies_line + "\n\n")
+        md.write("| # | Type | Version | Local Path | Link |\n")
+        md.write("| :--- | :--- | :--- | :--- | :--- |\n")
         for j, m in enumerate(group, start=1):
-            md.write(f"| {j} | {m['type']} | {m['version']} | `{m['file_rel_path']}` |\n")
+            link_cell = m["link_type"] or "-"
+            md.write(f"| {j} | {m['type']} | {m['version']} | `{m['file_rel_path']}` | {link_cell} |\n")
         md.write("\n")
+
+    if link_file_count:
+        md.write("> **Note:** Entries marked `Symlink`/`Junction`/`Hardlink` are link-type paths "
+                 "(detected the same way as `civitai_scanner.py`); they may point to the same "
+                 "physical file and are not true extra copies. Only unmarked entries occupy "
+                 "additional disk space.\n\n")
 
     md.write("---\n\n")
 
