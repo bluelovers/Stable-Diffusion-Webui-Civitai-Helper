@@ -9,6 +9,53 @@ Civitai Model Scanner CLI
 
 依賴: requests
 安裝: pip install requests
+
+參數說明:
+    path                    要掃描的目錄 (必填)。會掃描根目錄及其下所有子目錄。
+
+    --refetch               強制重新從 Civitai API 抓取所有模型的元數據，
+                            並重寫 .civitai.info。
+
+    --refetch-only-not-found  只重新抓取先前未找到 (骨架 skeleton) 的模型元數據，
+                            已有完整資訊者略過。
+
+    --no-cover              不下載封面預覽圖。
+
+    --download-video        額外下載第一部影片附件 (存為 {模型名}.preview.mp4)。
+                            預設只取第一張「圖片」當封面，影片不會被誤存為 .preview.png。
+
+    --attachments-only      只依現有有效的 .civitai.info 重新下載缺漏的封面/影片。
+                            完全不呼叫 API、不重算模型 SHA256、不寫入任何 .civitai.info。
+                            適合只想補齊附件、不動元數據的情境。
+
+    --force-attachments     略過「附件已存在」檢查，強制重新下載以取代舊檔。
+                            適合用來替換可能損毀的 .preview.png。
+
+    --api-base URL          Civitai API 位址 (預設: https://civitai.red)。
+
+    --help                  列出所有參數說明 (由 argparse 內建提供)。
+
+環境變數 (對應上述參數，命令列未指定時採用):
+    CIVITAI_HELPER_API_BASE                 對應 --api-base
+    CIVITAI_HELPER_REFETCH                  對應 --refetch (1/true/yes)
+    CIVITAI_HELPER_REFETCH_ONLY_NOT_FOUND   對應 --refetch-only-not-found (1/true/yes)
+    CIVITAI_HELPER_NO_COVER                 對應 --no-cover (1/true/yes)
+    CIVITAI_HELPER_DOWNLOAD_VIDEO           對應 --download-video (1/true/yes)
+    CIVITAI_HELPER_ATTACHMENTS_ONLY         對應 --attachments-only (1/true/yes)
+    CIVITAI_HELPER_FORCE_ATTACHMENTS        對應 --force-attachments (1/true/yes)
+
+使用範例:
+    # 掃描目錄，更新元數據並下載封面
+    civitai_scanner.bat "D:\\sd-forge\\models\\Stable-diffusion"
+
+    # 只補齊缺漏的封面/影片，完全不動 .civitai.info
+    civitai_scanner.bat "D:\\sd-forge\\models\\Stable-diffusion" --attachments-only
+
+    # 強制重建所有封面 (取代可能損毀的 .preview.png)，仍不動 .civitai.info
+    civitai_scanner.bat "D:\\sd-forge\\models" --attachments-only --force-attachments
+
+    # 連同第一部影片一起下載
+    civitai_scanner.bat "D:\\sd-forge\\models" --attachments-only --download-video
 """
 
 import os
@@ -30,6 +77,7 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 EXTS = {".bin", ".pt", ".safetensors", ".ckpt", ".gguf", ".zip"}
 INFO_SUFFIX = ".civitai.info"
 PREVIEW_SUFFIX = ".preview.png"
+VIDEO_EXTS = {".mp4", ".webm", ".mov", ".m4v", ".avi"}
 SHORT_NAME = "sd_civitai_helper"
 VERSION = "1.8.13"  # 保持與主專案一致或自定義
 DELAY = 0.5  # API 請求間隔 (秒)
@@ -71,6 +119,7 @@ class Colors:
     GREEN = "\033[92m" if USE_COLORS else ""
     YELLOW = "\033[93m" if USE_COLORS else ""
     BLUE = "\033[94m" if USE_COLORS else ""
+    MAGENTA = "\033[95m" if USE_COLORS else ""
     CYAN = "\033[96m" if USE_COLORS else ""
     GRAY = "\033[90m" if USE_COLORS else ""
 
@@ -176,15 +225,34 @@ def process_model_info(info, is_skeleton=False):
     }
     return info
 
-def download_cover_image(filepath, info, max_size=True):
+def get_attachment_kind(item):
+    """判斷 images 陣列中單筆附件的類型
+    Civitai 的 images 陣列可能混有 video (mp4/webm) 與 image，
+    有 type 欄位時以 type 為準，否則用 URL 副檔名判斷。
+    回傳: "video" / "image"
+    """
+    item_type = (item.get("type") or "").lower()
+    if item_type in ("video", "image"):
+        return item_type
+
+    # 沒有 type 欄位時，退回用 URL 副檔名判斷 (忽略 query string)
+    url_no_query = (item.get("url") or "").split("?")[0].lower()
+    ext = os.path.splitext(url_no_query)[1]
+    if ext in VIDEO_EXTS:
+        return "video"
+    return "image"
+
+def download_cover_image(filepath, info, max_size=True, force=False):
     """下載模型的封面預覽圖
+    封面取第一個「圖片」附件，跳過 video 類型，避免把影片存成 .preview.png
+    force=True 時略過「已存在」檢查，重新下載以取代可能損毀的舊檔
     返回: CoverStatus 枚舉值
     """
     # 檢查是否已有預覽圖
     base, _ = os.path.splitext(filepath)
     preview_path = f"{base}{PREVIEW_SUFFIX}"
 
-    if os.path.exists(preview_path):
+    if os.path.exists(preview_path) and not force:
         return EnumCoverStatus.EXISTS
 
     # 從 API 回應中獲取圖片列表
@@ -192,8 +260,11 @@ def download_cover_image(filepath, info, max_size=True):
     if not images:
         return EnumCoverStatus.NO_IMAGE
 
-    # 選擇第一張圖片
-    img = images[0]
+    # 選擇第一個圖片附件 (跳過 video，否則會下載到 mp4 導致預覽圖損毀)
+    img = next((item for item in images if get_attachment_kind(item) == "image"), None)
+    if img is None:
+        return EnumCoverStatus.NO_IMAGE
+
     img_url = img.get("url", "")
     if not img_url:
         return EnumCoverStatus.NO_IMAGE
@@ -219,7 +290,7 @@ def download_cover_image(filepath, info, max_size=True):
 
     return EnumCoverStatus.FAILED
 
-def try_download_cover(filepath, info_path, stats_obj, progress_prefix, max_size_preview, info=None):
+def try_download_cover(filepath, info_path, stats_obj, progress_prefix, max_size_preview, info=None, force=False):
     """嘗試下載封面圖 (統一邏輯)
     返回: True 如果成功下載了新封面
     """
@@ -235,12 +306,54 @@ def try_download_cover(filepath, info_path, stats_obj, progress_prefix, max_size
     if not info or not info.get("images"):
         return False
 
-    result = download_cover_image(filepath, info, max_size_preview)
+    result = download_cover_image(filepath, info, max_size_preview, force)
     if result == EnumCoverStatus.DOWNLOADED:
         stats_obj["covers"] += 1
         model_name = info.get('model', {}).get('name', 'Unknown')
         print_log(f"{progress_prefix} Cover downloaded: {Colors.GREEN}{model_name}", Colors.RESET)
         return True
+
+    return False
+
+def download_video_file(filepath, info, stats_obj, progress_prefix, force=False):
+    """下載 info 中第一部 video 附件 (選擇性功能)
+    只下載 images 陣列中第一部影片，不抓全部
+    存檔名: {base}.preview.mp4
+    已存在的影片會跳過 (force=True 時重新下載)
+    返回: True 如果成功下載
+    """
+    vid = next((item for item in info.get("images", [])
+                if get_attachment_kind(item) == "video" and item.get("url")), None)
+    if vid is None:
+        return False
+
+    base, _ = os.path.splitext(filepath)
+    headers = {"User-Agent": USER_AGENT}
+
+    # 依 URL 副檔名存檔，抓不到時預設 .mp4
+    url_no_query = vid["url"].split("?")[0]
+    vid_ext = os.path.splitext(url_no_query)[1].lower()
+    if vid_ext not in VIDEO_EXTS:
+        vid_ext = ".mp4"
+
+    video_path = f"{base}.preview{vid_ext}"
+    if os.path.exists(video_path) and not force:
+        return False
+
+    try:
+        response = requests.get(vid["url"], headers=headers, timeout=60, stream=True)
+        if response.status_code == 200:
+            with open(video_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+            stats_obj["videos"] += 1
+            print_log(f"{progress_prefix} Video downloaded: {Colors.GREEN}{os.path.basename(video_path)}", Colors.RESET)
+            return True
+        else:
+            print_log(f"{progress_prefix} Video HTTP {response.status_code}: {vid['url']}", Colors.YELLOW)
+    except Exception as e:
+        print_log(f"{progress_prefix} Video download error: {e}", Colors.YELLOW)
 
     return False
 
@@ -306,6 +419,11 @@ def print_summary(title, stats, scan_root=None):
     covers_count = stats.get('covers', 0)
     covers_color = Colors.CYAN if covers_count > 0 else ""
     print(f"Covers:        {covers_color}{covers_count}{Colors.RESET}")
+
+    # Videos downloaded (Magenta if > 0)
+    video_count = stats.get('videos', 0)
+    video_color = Colors.MAGENTA if video_count > 0 else ""
+    print(f"Videos:        {video_color}{video_count}{Colors.RESET}")
 
     # Duplicates (Blue if > 0)
     dup_count = len(stats['duplicates'])
@@ -420,15 +538,25 @@ def get_link_type(filepath, root_directory):
 
     return ""
 
-def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, download_cover=True, max_size_preview=True):
-    """文件掃描主函數 (支援子目錄總結)"""
+def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, download_cover=True, max_size_preview=True, download_video=False, attachments_only=False, force_attachments=False):
+    """文件掃描主函數 (支援子目錄總結)
+    attachments_only=True 時，僅依現有 .civitai.info 重新下載封面/影片附件，
+    不重新抓取 API、不改動任何 .civitai.info 檔案。
+    force_attachments=True 時，略過「附件已存在」檢查，重新下載以取代舊檔。
+    """
     print_log(f"Starting scan in: {directory}", Colors.BLUE)
+    if attachments_only:
+        print_log("Attachments-only mode: ENABLED (info files untouched)", Colors.MAGENTA)
+    if force_attachments:
+        print_log("Force attachments: ENABLED (existing attachments re-downloaded)", Colors.MAGENTA)
     if download_cover:
         print_log("Cover download: ENABLED", Colors.CYAN)
+    if download_video:
+        print_log("Video download: ENABLED", Colors.CYAN)
 
     global_stats = {
         "processed": 0, "ignored": 0, "updated": 0,
-        "not_found": 0, "failed": 0, "duplicates": [], "covers": 0
+        "not_found": 0, "failed": 0, "duplicates": [], "covers": 0, "videos": 0
     }
 
     # 使用 mutable list 來讓內嵌函式修改計數
@@ -452,11 +580,32 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, d
         relative_path = os.path.relpath(filepath, start=directory)
         progress_prefix = f"{Colors.GRAY}[{counter[0]}]{Colors.RESET}"
 
+        base, _ = os.path.splitext(filepath)
+        info_path = f"{base}{INFO_SUFFIX}"
+
+        # --- Attachments-only: 只重抓附件，絕不碰 info、不重算 hash ---
+        if attachments_only:
+            if not os.path.exists(info_path):
+                return
+
+            try:
+                with open(info_path, 'r', encoding='utf-8') as f:
+                    local_info = json.load(f)
+            except Exception:
+                return
+
+            # 無效/骨架 info (無 images) 則略過
+            if not local_info.get("images"):
+                return
+
+            if download_cover:
+                try_download_cover(filepath, info_path, stats_obj, progress_prefix, max_size_preview, local_info, force_attachments)
+            if download_video:
+                download_video_file(filepath, local_info, stats_obj, progress_prefix, force_attachments)
+            return
 
         # 0. 嘗試從現有元數據讀取 Hash (優化效能)
         model_hash = None
-        base, _ = os.path.splitext(filepath)
-        info_path = f"{base}{INFO_SUFFIX}"
 
         if not refetch_old and os.path.exists(info_path):
             try:
@@ -521,9 +670,20 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, d
             if not is_duplicate:
                 stats_obj["ignored"] += 1
 
-            # 即使不需要更新元數據，仍可下載封面圖
-            if download_cover and not is_duplicate:
-                try_download_cover(filepath, info_path, stats_obj, progress_prefix, max_size_preview)
+            # 即使不需要更新元數據，仍可下載封面圖 / 影片
+            if (download_cover or download_video) and not is_duplicate:
+                local_info = None
+                if os.path.exists(info_path):
+                    try:
+                        with open(info_path, 'r', encoding='utf-8') as f:
+                            local_info = json.load(f)
+                    except Exception:
+                        local_info = None
+
+                if download_cover:
+                    try_download_cover(filepath, info_path, stats_obj, progress_prefix, max_size_preview, local_info, force_attachments)
+                if download_video and local_info:
+                    download_video_file(filepath, local_info, stats_obj, progress_prefix, force_attachments)
             return
 
         # --- If execution reaches here, we DO need to write/update metadata ---
@@ -567,7 +727,11 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, d
 
             # 下載封面圖
             if download_cover and not is_skeleton:
-                try_download_cover(filepath, info_path, stats_obj, progress_prefix, max_size_preview, info)
+                try_download_cover(filepath, info_path, stats_obj, progress_prefix, max_size_preview, info, force_attachments)
+
+            # 下載影片附件 (選擇性，只取第一部)
+            if download_video and not is_skeleton:
+                download_video_file(filepath, info, stats_obj, progress_prefix, force_attachments)
         else:
             stats_obj["failed"] += 1
 
@@ -597,7 +761,7 @@ def scan_directory(directory, refetch_old=False, refetch_only_not_found=False, d
 
         subdir_stats = {
             "processed": 0, "ignored": 0, "updated": 0,
-            "not_found": 0, "failed": 0, "duplicates": [], "covers": 0
+            "not_found": 0, "failed": 0, "duplicates": [], "covers": 0, "videos": 0
         }
 
         # 對該子目錄進行遞歸掃描 (啟用 followlinks 以進入 junction)
@@ -630,14 +794,41 @@ def main():
     env_no_cover = os.environ.get("CIVITAI_HELPER_NO_COVER", "").lower() in ("1", "true", "yes")
     env_refetch = os.environ.get("CIVITAI_HELPER_REFETCH", "").lower() in ("1", "true", "yes")
     env_refetch_not_found = os.environ.get("CIVITAI_HELPER_REFETCH_ONLY_NOT_FOUND", "").lower() in ("1", "true", "yes")
+    env_download_video = os.environ.get("CIVITAI_HELPER_DOWNLOAD_VIDEO", "").lower() in ("1", "true", "yes")
+    env_attachments_only = os.environ.get("CIVITAI_HELPER_ATTACHMENTS_ONLY", "").lower() in ("1", "true", "yes")
+    env_force_attachments = os.environ.get("CIVITAI_HELPER_FORCE_ATTACHMENTS", "").lower() in ("1", "true", "yes")
 
-    parser = argparse.ArgumentParser(description="Civitai Model Scanner CLI")
-    parser.add_argument("path", help="Directory path to scan")
-    parser.add_argument("--refetch", action="store_true", default=env_refetch, help="Force re-fetch existing metadata")
+    parser = argparse.ArgumentParser(
+        description="Civitai Model Scanner CLI - Scan model directory and generate/update .civitai.info metadata",
+        epilog="""Environment variables (used when not specified on command line, value: 1/true/yes):
+  CIVITAI_HELPER_API_BASE                 -> --api-base
+  CIVITAI_HELPER_REFETCH                  -> --refetch
+  CIVITAI_HELPER_REFETCH_ONLY_NOT_FOUND   -> --refetch-only-not-found
+  CIVITAI_HELPER_NO_COVER                 -> --no-cover
+  CIVITAI_HELPER_DOWNLOAD_VIDEO           -> --download-video
+  CIVITAI_HELPER_ATTACHMENTS_ONLY         -> --attachments-only
+  CIVITAI_HELPER_FORCE_ATTACHMENTS        -> --force-attachments
 
-    parser.add_argument("--refetch-only-not-found", action="store_true", default=env_refetch_not_found, help="Only re-fetch metadata for models that were not found previously")
+Examples:
+  civitai_scanner.bat "D:\\sd-forge\\models\\Stable-diffusion"
+  civitai_scanner.bat "D:\\models" --attachments-only
+  civitai_scanner.bat "D:\\models" --attachments-only --force-attachments
+  civitai_scanner.bat "D:\\models" --attachments-only --download-video
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("path", help="Directory to scan (subdirectories included)")
+    parser.add_argument("--refetch", action="store_true", default=env_refetch, help="Force re-fetch all model metadata and rewrite .civitai.info")
+
+    parser.add_argument("--refetch-only-not-found", action="store_true", default=env_refetch_not_found, help="Only re-fetch metadata for models not found previously (skeleton)")
 
     parser.add_argument("--no-cover", action="store_true", default=env_no_cover, help="Skip downloading model cover preview images")
+
+    parser.add_argument("--download-video", action="store_true", default=env_download_video, help="Also download the first video attachment (saved as {model}.preview.mp4)")
+
+    parser.add_argument("--attachments-only", action="store_true", default=env_attachments_only, help="Only re-download missing attachments from existing .civitai.info; no API calls, info files untouched")
+
+    parser.add_argument("--force-attachments", action="store_true", default=env_force_attachments, help="Ignore existing attachments and re-download to replace possibly corrupt files")
 
     parser.add_argument("--api-base", default=env_api_base, help=f"Civitai API base URL (default: {env_api_base})")
 
@@ -652,7 +843,7 @@ def main():
         sys.exit(1)
 
     try:
-        scan_directory(target_path, refetch_old=args.refetch, refetch_only_not_found=args.refetch_only_not_found, download_cover=not args.no_cover)
+        scan_directory(target_path, refetch_old=args.refetch, refetch_only_not_found=args.refetch_only_not_found, download_cover=not args.no_cover, download_video=args.download_video, attachments_only=args.attachments_only, force_attachments=args.force_attachments)
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.")
         sys.exit(0)
